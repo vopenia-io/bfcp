@@ -281,11 +281,16 @@ func (sess *Session) handleFloorRequest(msg *Message) {
 		return
 	}
 
-	// Get or create floor
+	// Get or create floor dynamically
 	floor, exists := sess.Server.GetFloor(floorID)
 	if !exists {
-		sess.sendError(msg, ErrorInvalidFloorID, fmt.Sprintf("Floor %d does not exist", floorID))
-		return
+		// Dynamically create the floor when first requested
+		sess.Server.AddFloor(floorID)
+		floor, exists = sess.Server.GetFloor(floorID)
+		if !exists {
+			sess.sendError(msg, ErrorInvalidFloorID, fmt.Sprintf("Failed to create floor %d", floorID))
+			return
+		}
 	}
 
 	// Generate a floor request ID

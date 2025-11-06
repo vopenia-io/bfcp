@@ -3,6 +3,7 @@ package bfcp
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"sync"
 	"time"
@@ -60,10 +61,16 @@ func NewTransport(conn net.Conn, role ConnectionRole) *Transport {
 
 // Dial creates an active BFCP connection to the specified address
 func Dial(address string) (*Transport, error) {
+	log.Printf("🔌 [BFCP Transport] Dialing TCP connection to %s (timeout: 10s)", address)
 	conn, err := net.DialTimeout("tcp", address, 10*time.Second)
 	if err != nil {
+		log.Printf("❌ [BFCP Transport] TCP dial failed to %s: %v", address, err)
 		return nil, fmt.Errorf("failed to dial %s: %w", address, err)
 	}
+
+	log.Printf("✅ [BFCP Transport] TCP connection established to %s", address)
+	log.Printf("   ➜ Local address: %s", conn.LocalAddr())
+	log.Printf("   ➜ Remote address: %s", conn.RemoteAddr())
 
 	return NewTransport(conn, RoleActive), nil
 }
@@ -83,12 +90,15 @@ func DialContext(ctx context.Context, address string) (*Transport, error) {
 
 // Start begins reading messages from the connection
 func (t *Transport) Start() {
+	log.Printf("📖 [BFCP Transport] Starting read loop (role: %s)", t.role)
 	go t.readLoop()
 }
 
 // readLoop continuously reads messages from the connection
 func (t *Transport) readLoop() {
+	log.Printf("🔄 [BFCP Transport] Read loop started")
 	defer func() {
+		log.Printf("🛑 [BFCP Transport] Read loop exiting, closing connection")
 		t.Close()
 		if t.OnClose != nil {
 			t.OnClose()
@@ -98,12 +108,14 @@ func (t *Transport) readLoop() {
 	for {
 		select {
 		case <-t.ctx.Done():
+			log.Printf("⏹️ [BFCP Transport] Context cancelled, stopping read loop")
 			return
 		default:
 		}
 
 		// Set read deadline to allow periodic context checks
 		if err := t.conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			log.Printf("❌ [BFCP Transport] Failed to set read deadline: %v", err)
 			if t.OnError != nil {
 				t.OnError(fmt.Errorf("failed to set read deadline: %w", err))
 			}
@@ -116,11 +128,17 @@ func (t *Transport) readLoop() {
 				// Timeout is expected, continue
 				continue
 			}
-			if !t.IsClosed() && t.OnError != nil {
-				t.OnError(fmt.Errorf("failed to read message: %w", err))
+			if !t.IsClosed() {
+				log.Printf("❌ [BFCP Transport] Read error: %v", err)
+				if t.OnError != nil {
+					t.OnError(fmt.Errorf("failed to read message: %w", err))
+				}
 			}
 			return
 		}
+
+		log.Printf("📨 [BFCP Transport] Message received: Primitive=%s, TxID=%d, Length=%d bytes",
+			msg.Primitive, msg.TransactionID, len(msg.Attributes))
 
 		if t.OnMessage != nil {
 			t.OnMessage(msg)
@@ -134,18 +152,25 @@ func (t *Transport) SendMessage(msg *Message) error {
 	defer t.mu.RUnlock()
 
 	if t.closed {
+		log.Printf("❌ [BFCP Transport] Cannot send - transport is closed")
 		return fmt.Errorf("transport is closed")
 	}
 
+	log.Printf("📤 [BFCP Transport] Sending message: Primitive=%s, TxID=%d, ConferenceID=%d, UserID=%d",
+		msg.Primitive, msg.TransactionID, msg.ConferenceID, msg.UserID)
+
 	// Set write deadline
 	if err := t.conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		log.Printf("❌ [BFCP Transport] Failed to set write deadline: %v", err)
 		return fmt.Errorf("failed to set write deadline: %w", err)
 	}
 
 	if err := WriteMessage(t.conn, msg); err != nil {
+		log.Printf("❌ [BFCP Transport] Failed to write message: %v", err)
 		return fmt.Errorf("failed to write message: %w", err)
 	}
 
+	log.Printf("✅ [BFCP Transport] Message sent successfully")
 	return nil
 }
 

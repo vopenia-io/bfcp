@@ -86,18 +86,22 @@ func NewClient(config *ClientConfig) *Client {
 // Connect establishes a connection to the BFCP server
 func (c *Client) Connect() error {
 	if c.connected.Load() {
+		c.logf("⚠️ Already connected to BFCP server")
 		return fmt.Errorf("already connected")
 	}
 
-	c.logf("Connecting to %s", c.config.ServerAddress)
+	c.logf("🔌 [BFCP] Attempting to connect to %s", c.config.ServerAddress)
 
 	transport, err := Dial(c.config.ServerAddress)
 	if err != nil {
+		c.logf("❌ [BFCP] Failed to connect to %s: %v", c.config.ServerAddress, err)
 		return fmt.Errorf("failed to connect: %w", err)
 	}
 
+	c.logf("✅ [BFCP] TCP connection established to %s", c.config.ServerAddress)
 	c.transport = transport
 	c.setState(StateConnected)
+	c.logf("🔄 [BFCP] State changed to: %s", StateConnected)
 
 	// Set up transport callbacks
 	transport.OnMessage = c.handleMessage
@@ -117,10 +121,14 @@ func (c *Client) Connect() error {
 	}
 
 	// Start reading messages
+	c.logf("📖 [BFCP] Starting transport read loop")
 	transport.Start()
 	c.connected.Store(true)
 
+	c.logf("✅ [BFCP] Client connected and ready (ConferenceID: %d, UserID: %d)", c.config.ConferenceID, c.config.UserID)
+
 	if c.OnConnected != nil {
+		c.logf("📞 [BFCP] Calling OnConnected callback")
 		c.OnConnected()
 	}
 
@@ -151,10 +159,12 @@ func (c *Client) Disconnect() error {
 // Hello sends a Hello message to the server
 func (c *Client) Hello() error {
 	if !c.connected.Load() {
+		c.logf("❌ [BFCP] Cannot send Hello - not connected")
 		return fmt.Errorf("not connected")
 	}
 
 	txID := c.nextTransactionID()
+	c.logf("👋 [BFCP] Sending Hello message (TxID: %d)", txID)
 	msg := NewMessage(PrimitiveHello, c.config.ConferenceID, txID, c.config.UserID)
 
 	// Add supported primitives
@@ -187,63 +197,81 @@ func (c *Client) Hello() error {
 	msg.AddSupportedAttributes(supportedAttributes)
 
 	// Send and wait for HelloAck
+	c.logf("⏳ [BFCP] Waiting for HelloAck (timeout: 5s)")
 	response, err := c.sendAndWait(msg, 5*time.Second)
 	if err != nil {
+		c.logf("❌ [BFCP] Hello handshake failed: %v", err)
 		return fmt.Errorf("failed to send Hello: %w", err)
 	}
 
 	if response.Primitive != PrimitiveHelloAck {
+		c.logf("❌ [BFCP] Expected HelloAck, got %s", response.Primitive)
 		return fmt.Errorf("expected HelloAck, got %s", response.Primitive)
 	}
 
 	c.setState(StateWaitFloorRequest)
-	c.logf("Hello handshake completed")
+	c.logf("✅ [BFCP] Hello handshake completed - ready to request floor")
+	c.logf("🔄 [BFCP] State changed to: %s", StateWaitFloorRequest)
 	return nil
 }
 
 // RequestFloor requests control of a floor
 func (c *Client) RequestFloor(floorID uint16, beneficiaryID uint16, priority Priority) (uint16, error) {
 	if !c.connected.Load() {
+		c.logf("❌ [BFCP] Cannot request floor - not connected")
 		return 0, fmt.Errorf("not connected")
 	}
 
 	txID := c.nextTransactionID()
+	c.logf("🎤 [BFCP] Requesting floor (FloorID: %d, BeneficiaryID: %d, Priority: %d, TxID: %d)", floorID, beneficiaryID, priority, txID)
 	msg := NewMessage(PrimitiveFloorRequest, c.config.ConferenceID, txID, c.config.UserID)
 
 	msg.AddFloorID(floorID)
 	if beneficiaryID > 0 {
 		msg.AddBeneficiaryID(beneficiaryID)
+		c.logf("   ➜ Added BENEFICIARY-ID: %d", beneficiaryID)
 	}
 	if priority > 0 {
 		msg.AddPriority(priority)
+		c.logf("   ➜ Added PRIORITY: %d", priority)
 	}
 
 	// Send and wait for FloorRequestStatus
+	c.logf("⏳ [BFCP] Waiting for FloorRequestStatus (timeout: 5s)")
 	response, err := c.sendAndWait(msg, 5*time.Second)
 	if err != nil {
+		c.logf("❌ [BFCP] Floor request failed: %v", err)
 		return 0, fmt.Errorf("failed to request floor: %w", err)
 	}
 
 	if response.Primitive == PrimitiveError {
 		errorCode, _ := response.GetErrorCode()
 		errorInfo, _ := response.GetErrorInfo()
+		c.logf("❌ [BFCP] Server returned error: %s - %s", errorCode, errorInfo)
 		return 0, fmt.Errorf("floor request failed: %s - %s", errorCode, errorInfo)
 	}
 
 	if response.Primitive != PrimitiveFloorRequestStatus {
+		c.logf("❌ [BFCP] Expected FloorRequestStatus, got %s", response.Primitive)
 		return 0, fmt.Errorf("expected FloorRequestStatus, got %s", response.Primitive)
 	}
+
+	c.logf("📩 [BFCP] Received FloorRequestStatus response")
 
 	// Extract floor request ID and status
 	requestID, ok := response.GetFloorRequestID()
 	if !ok {
+		c.logf("❌ [BFCP] Response missing FLOOR-REQUEST-ID attribute")
 		return 0, fmt.Errorf("missing FLOOR-REQUEST-ID in response")
 	}
+	c.logf("   ➜ Floor Request ID: %d", requestID)
 
-	status, _, ok := response.GetRequestStatus()
+	status, queuePos, ok := response.GetRequestStatus()
 	if !ok {
+		c.logf("❌ [BFCP] Response missing REQUEST-STATUS attribute")
 		return 0, fmt.Errorf("missing REQUEST-STATUS in response")
 	}
+	c.logf("   ➜ Request Status: %s (Queue Position: %d)", status, queuePos)
 
 	// Track the request
 	c.requestsMu.Lock()
@@ -257,21 +285,29 @@ func (c *Client) RequestFloor(floorID uint16, beneficiaryID uint16, priority Pri
 	}
 	c.requestsMu.Unlock()
 
-	c.logf("Floor %d requested (RequestID: %d, Status: %s)", floorID, requestID, status)
+	c.logf("📝 [BFCP] Floor %d request tracked (RequestID: %d, Status: %s)", floorID, requestID, status)
 
 	if status == RequestStatusGranted {
 		c.setState(StateFloorGranted)
+		c.logf("✅ [BFCP] Floor %d GRANTED immediately! 🎉", floorID)
+		c.logf("🔄 [BFCP] State changed to: %s", StateFloorGranted)
 		c.requestsMu.Lock()
 		if req, exists := c.activeRequests[floorID]; exists {
 			req.GrantedAt = time.Now()
+			c.logf("   ➜ Grant time recorded: %s", req.GrantedAt.Format("15:04:05.000"))
 		}
 		c.requestsMu.Unlock()
 
 		if c.OnFloorGranted != nil {
+			c.logf("📞 [BFCP] Calling OnFloorGranted callback (FloorID: %d, RequestID: %d)", floorID, requestID)
 			c.OnFloorGranted(floorID, requestID)
 		}
 	} else if status == RequestStatusPending || status == RequestStatusAccepted {
 		c.setState(StateFloorRequested)
+		c.logf("⏳ [BFCP] Floor %d request %s - waiting for grant", floorID, status)
+		c.logf("🔄 [BFCP] State changed to: %s", StateFloorRequested)
+	} else {
+		c.logf("⚠️ [BFCP] Floor %d request status: %s", floorID, status)
 	}
 
 	return requestID, nil
