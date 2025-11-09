@@ -14,11 +14,13 @@ This library implements:
 
 - Pure Go implementation (no CGO dependencies)
 - Full client and server roles
+- **Multi-conference support** - Single server manages multiple isolated conferences
 - TCP transport with proper framing
 - Complete message encoder/decoder with TLV (Type-Length-Value) support
 - Thread-safe state machine for floor management
 - Priority-based floor request queuing
 - Auto-grant mode for simple conferencing scenarios
+- Virtual client support for WebRTC participants
 - Comprehensive test suite
 - Production-ready examples
 
@@ -299,12 +301,52 @@ Run benchmarks:
 go test -bench=. -benchmem
 ```
 
+## Multi-Conference Support
+
+**NEW:** The BFCP server now supports multiple concurrent conferences on a single server instance!
+
+### Key Features
+
+- **Conference Isolation**: Each conference has isolated floors, sessions, and virtual clients
+- **Global Floor Allocation**: Automatic floor ID allocation prevents collisions across conferences
+- **Virtual Clients**: WebRTC participants can share screens without implementing BFCP protocol
+- **Thread-Safe**: All operations are concurrent-safe using proper locking
+
+### Quick Example
+
+```go
+server := bfcp.NewServer(config)
+cm := server.GetConferenceManager()
+
+// Call 1
+conf1 := uint32(100)
+cm.CreateConference(conf1, 10)
+floor1, _ := cm.AllocateFloor(conf1)  // Globally unique floor ID
+
+// Call 2 (concurrent)
+conf2 := uint32(200)
+cm.CreateConference(conf2, 20)
+floor2, _ := cm.AllocateFloor(conf2)  // Different floor ID, no collision!
+
+// Clean up
+cm.DeleteConference(conf1)
+cm.DeleteConference(conf2)
+```
+
+### Documentation
+
+For detailed multi-conference API reference and usage patterns, see:
+- **[MULTI_CONFERENCE.md](MULTI_CONFERENCE.md)** - Complete multi-conference guide
+- **[examples/multi_conference_example.go](examples/multi_conference_example.go)** - Working example
+- **[conference_test.go](conference_test.go)** - Unit tests
+
 ## Use Cases
 
 1. **SIP-to-WebRTC Gateway**: Enable Poly/Cisco endpoints to share slides in WebRTC conferences
 2. **Conference Bridge**: Manage floor control in multi-party conferences
-3. **Lecture Systems**: Control presentation rights in educational settings
-4. **Collaborative Tools**: Coordinate screen sharing in virtual meetings
+3. **Multi-Call SIP Server**: Handle multiple concurrent SIP calls with isolated floor control
+4. **Lecture Systems**: Control presentation rights in educational settings
+5. **Collaborative Tools**: Coordinate screen sharing in virtual meetings
 
 ## Roadmap
 

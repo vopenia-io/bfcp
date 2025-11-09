@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log"
 )
 
 // Message represents a BFCP protocol message with common header and attributes
@@ -113,6 +114,29 @@ func (m *Message) AddPriority(priority Priority) {
 	value := make([]byte, 2)
 	binary.BigEndian.PutUint16(value, uint16(priority))
 	m.AddAttribute(AttrPriority, value)
+}
+
+// AddGroupedAttribute adds a grouped attribute containing nested attributes
+// Grouped attributes encode their sub-attributes in the value field
+func (m *Message) AddGroupedAttribute(attrType AttributeType, subAttributes []Attribute) {
+	// Calculate total length of sub-attributes
+	var value []byte
+	for _, attr := range subAttributes {
+		// Each sub-attribute: Type(1) + Length(1) + Value(Length)
+		attrBytes := make([]byte, 2+len(attr.Value))
+		attrBytes[0] = uint8(attr.Type)
+		attrBytes[1] = attr.Length
+		copy(attrBytes[2:], attr.Value)
+
+		// Pad to 4-byte boundary
+		if padding := len(attrBytes) % 4; padding != 0 {
+			paddingBytes := make([]byte, 4-padding)
+			attrBytes = append(attrBytes, paddingBytes...)
+		}
+
+		value = append(value, attrBytes...)
+	}
+	m.AddAttribute(attrType, value)
 }
 
 // GetAttribute returns the first attribute of the given type, or nil if not found
@@ -240,7 +264,13 @@ func (m *Message) Encode() ([]byte, error) {
 		offset++
 
 		// Length (1 byte)
-		buf[offset] = attr.Length
+		// RFC 4582 v1: Length includes Type(1) + Length(1) + Value
+		// RFC 8855 v2: Length is only the value size
+		lengthField := attr.Length
+		if m.Version == ProtocolVersionRFC4582 {
+			lengthField = attr.Length + 2 // Add 2 for Type+Length header
+		}
+		buf[offset] = lengthField
 		offset++
 
 		// Value (Length bytes)
@@ -269,8 +299,9 @@ func Decode(data []byte) (*Message, error) {
 	msg.Version = (data[0] >> 5) & 0x07
 	msg.Reserved = data[0] & 0x1F
 
-	if msg.Version != ProtocolVersion {
-		return nil, fmt.Errorf("unsupported BFCP version: %d (expected %d)", msg.Version, ProtocolVersion)
+	// Accept both RFC 4582 (v1) and RFC 8855 (v2) - wire format is compatible
+	if msg.Version != ProtocolVersionRFC4582 && msg.Version != ProtocolVersionRFC8855 {
+		return nil, fmt.Errorf("unsupported BFCP version: %d (expected %d or %d)", msg.Version, ProtocolVersionRFC4582, ProtocolVersionRFC8855)
 	}
 
 	// Byte 1: Primitive
@@ -295,9 +326,14 @@ func Decode(data []byte) (*Message, error) {
 			len(data)-CommonHeaderLength, expectedPayloadSize)
 	}
 
+	log.Printf("🔍 [Decode] Parsing %s message: version=%d, payloadLength=%d words (%d bytes), confID=%d, txID=%d, userID=%d, totalBytes=%d",
+		msg.Primitive, msg.Version, msg.PayloadLength, expectedPayloadSize, msg.ConferenceID, msg.TransactionID, msg.UserID, len(data))
+
 	// Parse attributes
 	offset := CommonHeaderLength
 	endOffset := CommonHeaderLength + expectedPayloadSize
+
+	log.Printf("🔍 [Decode] Starting attribute parsing: offset=%d, endOffset=%d", offset, endOffset)
 
 	for offset < endOffset {
 		if offset+2 > endOffset {
@@ -312,23 +348,54 @@ func Decode(data []byte) (*Message, error) {
 		attrLength := data[offset]
 		offset++
 
-		// Value (attrLength bytes)
-		if offset+int(attrLength) > endOffset {
+		// RFC 4582 (v1) vs RFC 8855 (v2) difference:
+		// - v1: Length includes Type+Length header (total attribute size)
+		// - v2: Length is only the value size (excludes Type+Length header)
+		var valueLength int
+		if msg.Version == ProtocolVersionRFC4582 {
+			// v1: Length includes Type(1) + Length(1) = subtract 2
+			if attrLength < 2 {
+				log.Printf("❌ [Decode] ERROR: RFC 4582 attribute length too small: %d (must be >= 2)", attrLength)
+				log.Printf("📋 [Decode] Full message hex dump (%d bytes): %X", len(data), data)
+				return nil, fmt.Errorf("invalid RFC 4582 attribute length: %d", attrLength)
+			}
+			valueLength = int(attrLength) - 2
+		} else {
+			// v2: Length is the value size directly
+			valueLength = int(attrLength)
+		}
+
+		log.Printf("🔍 [Decode] Parsing attribute: type=%s(%d), length=%d bytes (v%d format), valueLength=%d, offset=%d, endOffset=%d, remaining=%d",
+			attrType, attrType, attrLength, msg.Version, valueLength, offset, endOffset, endOffset-offset)
+
+		// Value (valueLength bytes)
+		if offset+valueLength > endOffset {
+			log.Printf("❌ [Decode] ERROR: Attribute value exceeds bounds: need %d bytes, have %d bytes remaining",
+				valueLength, endOffset-offset)
+			// Dump the message for debugging
+			log.Printf("📋 [Decode] Full message hex dump (%d bytes): %X", len(data), data)
 			return nil, fmt.Errorf("attribute value exceeds message bounds at offset %d", offset)
 		}
 
-		value := make([]byte, attrLength)
-		copy(value, data[offset:offset+int(attrLength)])
-		offset += int(attrLength)
+		value := make([]byte, valueLength)
+		copy(value, data[offset:offset+valueLength])
+		offset += valueLength
 
 		msg.Attributes = append(msg.Attributes, Attribute{
 			Type:   attrType,
-			Length: attrLength,
+			Length: uint8(valueLength), // Store normalized value length
 			Value:  value,
 		})
 
 		// Skip padding to 4-byte boundary
-		attrTotalLen := 2 + int(attrLength)
+		// For v1: padding is based on original attrLength
+		// For v2: padding is based on Type+Length+Value = 2+valueLength
+		var attrTotalLen int
+		if msg.Version == ProtocolVersionRFC4582 {
+			attrTotalLen = int(attrLength)
+		} else {
+			attrTotalLen = 2 + valueLength
+		}
 		if padding := attrTotalLen % 4; padding != 0 {
 			offset += 4 - padding
 		}

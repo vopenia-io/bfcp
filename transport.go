@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -46,6 +47,11 @@ type Transport struct {
 	// Context for cancellation
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	// Keepalive settings
+	keepaliveInterval time.Duration
+	keepaliveSender   func() error // Function to send keepalive message
+	keepaliveWg       sync.WaitGroup
 }
 
 // NewTransport creates a new BFCP transport from an existing connection
@@ -88,10 +94,69 @@ func DialContext(ctx context.Context, address string) (*Transport, error) {
 	return transport, nil
 }
 
+// EnableKeepalive enables keepalive with the specified interval and sender function
+func (t *Transport) EnableKeepalive(interval time.Duration, sender func() error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.keepaliveInterval = interval
+	t.keepaliveSender = sender
+}
+
+// StartKeepalive starts the keepalive goroutine if configured
+// This should be called after EnableKeepalive() to actually start sending keepalives
+func (t *Transport) StartKeepalive() {
+	t.mu.RLock()
+	interval := t.keepaliveInterval
+	sender := t.keepaliveSender
+	t.mu.RUnlock()
+
+	if interval > 0 && sender != nil {
+		log.Printf("💓 [BFCP Transport] Starting keepalive (interval: %v)", interval)
+		t.keepaliveWg.Add(1)
+		go t.keepaliveLoop()
+	}
+}
+
 // Start begins reading messages from the connection
 func (t *Transport) Start() {
 	log.Printf("📖 [BFCP Transport] Starting read loop (role: %s)", t.role)
 	go t.readLoop()
+
+	// Start keepalive if configured
+	if t.keepaliveInterval > 0 && t.keepaliveSender != nil {
+		log.Printf("💓 [BFCP Transport] Starting keepalive (interval: %v)", t.keepaliveInterval)
+		t.keepaliveWg.Add(1)
+		go t.keepaliveLoop()
+	}
+}
+
+// keepaliveLoop sends periodic keepalive messages
+func (t *Transport) keepaliveLoop() {
+	defer t.keepaliveWg.Done()
+	ticker := time.NewTicker(t.keepaliveInterval)
+	defer ticker.Stop()
+
+	log.Printf("💓 [BFCP Transport] Keepalive loop started (interval: %v)", t.keepaliveInterval)
+
+	for {
+		select {
+		case <-t.ctx.Done():
+			log.Printf("⏹️ [BFCP Transport] Keepalive loop stopping (context cancelled)")
+			return
+		case <-ticker.C:
+			if t.IsClosed() {
+				log.Printf("⏹️ [BFCP Transport] Keepalive loop stopping (transport closed)")
+				return
+			}
+
+			log.Printf("💓 [BFCP Transport] Sending keepalive message")
+			if err := t.keepaliveSender(); err != nil {
+				log.Printf("⚠️ [BFCP Transport] Keepalive send failed: %v", err)
+				// Don't stop on keepalive failure - connection might still be alive
+			}
+		}
+	}
 }
 
 // readLoop continuously reads messages from the connection
@@ -124,10 +189,40 @@ func (t *Transport) readLoop() {
 
 		msg, err := ReadMessage(t.conn)
 		if err != nil {
+			// Check for timeout (both typed and string-based)
+			// ReadMessage() may wrap the timeout error, so we check both ways
+			isTimeout := false
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				// Timeout is expected, continue
+				isTimeout = true
+			} else if strings.Contains(err.Error(), "i/o timeout") {
+				isTimeout = true
+			}
+
+			if isTimeout {
+				// Timeout is expected when using keepalives
+				// Just continue reading, keepalive will maintain connection health
 				continue
 			}
+
+			// Check if this is EOF or connection closed (graceful shutdown scenarios)
+			isEOF := strings.Contains(err.Error(), "EOF")
+			isConnClosed := strings.Contains(err.Error(), "use of closed network connection")
+
+			if isEOF || isConnClosed {
+				// EOF or closed connection - check if it's expected
+				select {
+				case <-t.ctx.Done():
+					// Context cancelled - this is intentional close
+					log.Printf("⏹️ [BFCP Transport] Connection closed during graceful shutdown")
+					return
+				default:
+					// Remote peer closed connection - this is normal, not an error
+					log.Printf("⏹️ [BFCP Transport] Connection closed by remote peer")
+					return
+				}
+			}
+
+			// Real error - log and close connection
 			if !t.IsClosed() {
 				log.Printf("❌ [BFCP Transport] Read error: %v", err)
 				if t.OnError != nil {
@@ -159,13 +254,21 @@ func (t *Transport) SendMessage(msg *Message) error {
 	log.Printf("📤 [BFCP Transport] Sending message: Primitive=%s, TxID=%d, ConferenceID=%d, UserID=%d",
 		msg.Primitive, msg.TransactionID, msg.ConferenceID, msg.UserID)
 
+	// Encode message to get hex dump
+	data, err := msg.Encode()
+	if err != nil {
+		log.Printf("❌ [BFCP Transport] Failed to encode message: %v", err)
+		return fmt.Errorf("failed to encode message: %w", err)
+	}
+	log.Printf("🔍 [BFCP Transport] Message hex dump (%d bytes): %X", len(data), data)
+
 	// Set write deadline
 	if err := t.conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		log.Printf("❌ [BFCP Transport] Failed to set write deadline: %v", err)
 		return fmt.Errorf("failed to set write deadline: %w", err)
 	}
 
-	if err := WriteMessage(t.conn, msg); err != nil {
+	if _, err := t.conn.Write(data); err != nil {
 		log.Printf("❌ [BFCP Transport] Failed to write message: %v", err)
 		return fmt.Errorf("failed to write message: %w", err)
 	}
@@ -177,14 +280,17 @@ func (t *Transport) SendMessage(msg *Message) error {
 // Close closes the transport connection
 func (t *Transport) Close() error {
 	t.mu.Lock()
-	defer t.mu.Unlock()
-
 	if t.closed {
+		t.mu.Unlock()
 		return nil
 	}
 
 	t.closed = true
 	t.cancel()
+	t.mu.Unlock()
+
+	// Wait for keepalive goroutine to finish
+	t.keepaliveWg.Wait()
 
 	if t.conn != nil {
 		return t.conn.Close()

@@ -4,9 +4,11 @@ package bfcp
 
 import "fmt"
 
-// BFCP Protocol Version
+// BFCP Protocol Versions
 const (
-	ProtocolVersion = 2 // RFC 8855
+	ProtocolVersionRFC4582 = 1 // RFC 4582 (original BFCP)
+	ProtocolVersionRFC8855 = 2 // RFC 8855 (updated BFCP)
+	ProtocolVersion        = ProtocolVersionRFC8855 // Default version for outgoing messages
 )
 
 // Common field lengths
