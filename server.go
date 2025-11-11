@@ -391,7 +391,7 @@ func (sess *Session) handleHello(msg *Message) {
 
 // handleFloorRequest processes a FloorRequest message
 func (sess *Session) handleFloorRequest(msg *Message) {
-	sess.Server.logf("📋 [FloorRequest] Processing request from user %d", msg.UserID)
+	sess.Server.logf("📋 [FloorRequest] Processing request from user %d (confID=%d)", msg.UserID, msg.ConferenceID)
 
 	// Get floor ID from message
 	floorID, ok := msg.GetFloorID()
@@ -400,16 +400,23 @@ func (sess *Session) handleFloorRequest(msg *Message) {
 		sess.sendError(msg, ErrorInvalidFloorID, "No floor ID in request")
 		return
 	}
-	sess.Server.logf("📋 [FloorRequest] Requesting floor ID: %d", floorID)
+	sess.Server.logf("📋 [FloorRequest] Requesting floor ID: %d from conference %d", floorID, msg.ConferenceID)
 
-	// Get the floor
-	floor, exists := sess.Server.GetFloor(floorID)
+	// Get the floor from the correct conference (use msg.ConferenceID, not default)
+	conf, confExists := sess.Server.conferenceManager.GetConference(msg.ConferenceID)
+	if !confExists {
+		sess.Server.logf("❌ [FloorRequest] Conference %d does not exist", msg.ConferenceID)
+		sess.sendError(msg, ErrorInvalidFloorID, fmt.Sprintf("Conference %d does not exist", msg.ConferenceID))
+		return
+	}
+
+	floor, exists := conf.GetFloor(floorID)
 	if !exists {
-		sess.Server.logf("❌ [FloorRequest] Floor %d does not exist", floorID)
+		sess.Server.logf("❌ [FloorRequest] Floor %d does not exist in conference %d", floorID, msg.ConferenceID)
 		sess.sendError(msg, ErrorInvalidFloorID, fmt.Sprintf("Floor %d does not exist", floorID))
 		return
 	} else {
-		sess.Server.logf("✅ [FloorRequest] Floor %d exists", floorID)
+		sess.Server.logf("✅ [FloorRequest] Floor %d exists in conference %d", floorID, msg.ConferenceID)
 	}
 
 	// Generate a floor request ID
@@ -498,7 +505,7 @@ func (sess *Session) handleFloorRequest(msg *Message) {
 
 // handleFloorRelease processes a FloorRelease message
 func (sess *Session) handleFloorRelease(msg *Message) {
-	sess.Server.logf("🔓 [FloorRelease] Processing release from user %d", msg.UserID)
+	sess.Server.logf("🔓 [FloorRelease] Processing release from user %d (confID=%d)", msg.UserID, msg.ConferenceID)
 
 	floorID, ok := msg.GetFloorID()
 	if !ok {
@@ -507,9 +514,17 @@ func (sess *Session) handleFloorRelease(msg *Message) {
 		return
 	}
 
-	floor, exists := sess.Server.GetFloor(floorID)
+	// Get the floor from the correct conference
+	conf, confExists := sess.Server.conferenceManager.GetConference(msg.ConferenceID)
+	if !confExists {
+		sess.Server.logf("❌ [FloorRelease] Conference %d does not exist", msg.ConferenceID)
+		sess.sendError(msg, ErrorInvalidFloorID, fmt.Sprintf("Conference %d does not exist", msg.ConferenceID))
+		return
+	}
+
+	floor, exists := conf.GetFloor(floorID)
 	if !exists {
-		sess.Server.logf("❌ [FloorRelease] Floor %d does not exist", floorID)
+		sess.Server.logf("❌ [FloorRelease] Floor %d does not exist in conference %d", floorID, msg.ConferenceID)
 		sess.sendError(msg, ErrorInvalidFloorID, fmt.Sprintf("Floor %d does not exist", floorID))
 		return
 	}
@@ -551,7 +566,14 @@ func (sess *Session) handleFloorQuery(msg *Message) {
 		return
 	}
 
-	floor, exists := sess.Server.GetFloor(floorID)
+	// Get the floor from the correct conference
+	conf, confExists := sess.Server.conferenceManager.GetConference(msg.ConferenceID)
+	if !confExists {
+		sess.sendError(msg, ErrorInvalidFloorID, fmt.Sprintf("Conference %d does not exist", msg.ConferenceID))
+		return
+	}
+
+	floor, exists := conf.GetFloor(floorID)
 	if !exists {
 		sess.sendError(msg, ErrorInvalidFloorID, fmt.Sprintf("Floor %d does not exist", floorID))
 		return
