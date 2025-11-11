@@ -369,9 +369,8 @@ func (sess *Session) handleHello(msg *Message) {
 
 	// Enable keepalive to prevent connection timeout (30 second interval)
 	sess.Transport.EnableKeepalive(30*time.Second, func() error {
-		sess.Server.logf("💓 [Keepalive] Sending Hello keepalive to user %d", msg.UserID)
 		keepaliveMsg := NewMessage(PrimitiveHello, msg.ConferenceID, uint16(sess.Server.nextTxID.Add(1)), msg.UserID)
-		return sess.Transport.SendMessage(keepaliveMsg)
+		return sess.Transport.SendKeepaliveMessage(keepaliveMsg)
 	})
 	sess.Server.logf("💓 [Hello] Keepalive enabled (30s interval)")
 

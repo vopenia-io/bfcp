@@ -150,7 +150,7 @@ func (t *Transport) keepaliveLoop() {
 				return
 			}
 
-			log.Printf("💓 [BFCP Transport] Sending keepalive message")
+			// Call keepalive sender without the extra log (sender will handle logging)
 			if err := t.keepaliveSender(); err != nil {
 				log.Printf("⚠️ [BFCP Transport] Keepalive send failed: %v", err)
 				// Don't stop on keepalive failure - connection might still be alive
@@ -243,6 +243,16 @@ func (t *Transport) readLoop() {
 
 // SendMessage sends a BFCP message over the transport
 func (t *Transport) SendMessage(msg *Message) error {
+	return t.sendMessage(msg, false)
+}
+
+// SendKeepaliveMessage sends a BFCP keepalive message with minimal logging
+func (t *Transport) SendKeepaliveMessage(msg *Message) error {
+	return t.sendMessage(msg, true)
+}
+
+// sendMessage sends a BFCP message over the transport with optional verbose flag
+func (t *Transport) sendMessage(msg *Message, isKeepalive bool) error {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
@@ -251,16 +261,12 @@ func (t *Transport) SendMessage(msg *Message) error {
 		return fmt.Errorf("transport is closed")
 	}
 
-	log.Printf("📤 [BFCP Transport] Sending message: Primitive=%s, TxID=%d, ConferenceID=%d, UserID=%d",
-		msg.Primitive, msg.TransactionID, msg.ConferenceID, msg.UserID)
-
-	// Encode message to get hex dump
+	// Encode message
 	data, err := msg.Encode()
 	if err != nil {
 		log.Printf("❌ [BFCP Transport] Failed to encode message: %v", err)
 		return fmt.Errorf("failed to encode message: %w", err)
 	}
-	log.Printf("🔍 [BFCP Transport] Message hex dump (%d bytes): %X", len(data), data)
 
 	// Set write deadline
 	if err := t.conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
@@ -273,7 +279,17 @@ func (t *Transport) SendMessage(msg *Message) error {
 		return fmt.Errorf("failed to write message: %w", err)
 	}
 
-	log.Printf("✅ [BFCP Transport] Message sent successfully")
+	// For keepalive messages, log a single concise line
+	if isKeepalive {
+		log.Printf("💓 [BFCP] Keepalive sent to user %d (TxID=%d, %d bytes)", msg.UserID, msg.TransactionID, len(data))
+	} else {
+		// For non-keepalive messages, log verbose details
+		log.Printf("📤 [BFCP Transport] Sending message: Primitive=%s, TxID=%d, ConferenceID=%d, UserID=%d",
+			msg.Primitive, msg.TransactionID, msg.ConferenceID, msg.UserID)
+		log.Printf("🔍 [BFCP Transport] Message hex dump (%d bytes): %X", len(data), data)
+		log.Printf("✅ [BFCP Transport] Message sent successfully")
+	}
+
 	return nil
 }
 
