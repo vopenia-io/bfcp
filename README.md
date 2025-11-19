@@ -14,7 +14,7 @@ This library implements:
 
 - Pure Go implementation (no CGO dependencies)
 - Full client and server roles
-- **Multi-conference support** - Single server manages multiple isolated conferences
+- Single conference per server for simple deployment
 - TCP transport with proper framing
 - Complete message encoder/decoder with TLV (Type-Length-Value) support
 - Thread-safe state machine for floor management
@@ -49,8 +49,8 @@ func main() {
 
     server := bfcp.NewServer(config)
 
-    // Add floors for content sharing
-    server.AddFloor(1)  // Floor 1: Main slides stream
+    // Create floors for content sharing
+    server.CreateFloor(1)  // Floor 1: Main slides stream
 
     // Set up event callbacks
     server.OnFloorGranted = func(floorID, userID, requestID uint16) {
@@ -209,16 +209,15 @@ a=floorid:1 mstrm:3
 config := bfcp.DefaultServerConfig(":5070", conferenceID)
 server := bfcp.NewServer(config)
 
-// Add/remove floors
-server.AddFloor(floorID uint16)
-server.RemoveFloor(floorID uint16)
+// Create/release floors
+server.CreateFloor(floorID uint16)
+server.ReleaseFloor(floorID uint16)
 
-// Check floor availability
-canGrant := server.CanGrant(floorID)
+// Get floor state
+floor, exists := server.GetFloor(floorID)
 
-// Manual grant/deny (when AutoGrant is false)
-server.Grant(floorID, userID)
-server.Deny(floorID, userID)
+// Manual grant (when AutoGrant is false)
+server.GrantFloor(floorID, userID)
 
 // Start server
 server.ListenAndServe()
@@ -301,44 +300,38 @@ Run benchmarks:
 go test -bench=. -benchmem
 ```
 
-## Multi-Conference Support
+## Simple Floor Management
 
-**NEW:** The BFCP server now supports multiple concurrent conferences on a single server instance!
+The server manages floors directly without conference isolation overhead.
 
 ### Key Features
 
-- **Conference Isolation**: Each conference has isolated floors, sessions, and virtual clients
-- **Global Floor Allocation**: Automatic floor ID allocation prevents collisions across conferences
-- **Virtual Clients**: WebRTC participants can share screens without implementing BFCP protocol
+- **Direct Floor Access**: Create, get, and release floors with simple API
 - **Thread-Safe**: All operations are concurrent-safe using proper locking
+- **Single Conference**: One server instance manages one conference
 
 ### Quick Example
 
 ```go
+config := bfcp.DefaultServerConfig(":5070", 1)
 server := bfcp.NewServer(config)
-cm := server.GetConferenceManager()
 
-// Call 1
-conf1 := uint32(100)
-cm.CreateConference(conf1, 10)
-floor1, _ := cm.AllocateFloor(conf1)  // Globally unique floor ID
+// Create floor
+floor := server.CreateFloor(1)
 
-// Call 2 (concurrent)
-conf2 := uint32(200)
-cm.CreateConference(conf2, 20)
-floor2, _ := cm.AllocateFloor(conf2)  // Different floor ID, no collision!
+// Get floor
+floor, exists := server.GetFloor(1)
 
-// Clean up
-cm.DeleteConference(conf1)
-cm.DeleteConference(conf2)
+// Release floor
+server.ReleaseFloor(1)
 ```
 
-### Documentation
+### Server API
 
-For detailed multi-conference API reference and usage patterns, see:
-- **[MULTI_CONFERENCE.md](MULTI_CONFERENCE.md)** - Complete multi-conference guide
-- **[examples/multi_conference_example.go](examples/multi_conference_example.go)** - Working example
-- **[conference_test.go](conference_test.go)** - Unit tests
+- `CreateFloor(floorID uint16)` - Create new floor
+- `GetFloor(floorID uint16)` - Get existing floor
+- `ReleaseFloor(floorID uint16)` - Release floor
+- `GrantFloor(floorID, userID uint16)` - Grant floor to user
 
 ## Use Cases
 

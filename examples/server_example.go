@@ -19,11 +19,11 @@ func main() {
 	// Create the server
 	server := bfcp.NewServer(config)
 
-	// Add floors for the conference
+	// Create floors for the conference
 	// Floor 1: Slides/Content sharing
-	server.AddFloor(1)
+	server.CreateFloor(1)
 	// Floor 2: Additional content stream
-	server.AddFloor(2)
+	server.CreateFloor(2)
 
 	// Set up event callbacks
 	server.OnClientConnect = func(remoteAddr string, userID uint16) {
@@ -44,13 +44,13 @@ func main() {
 		}
 
 		// For floor 2, check if it's available
-		canGrant := server.CanGrant(floorID)
-		if canGrant {
-			log.Printf("Granting floor %d to user %d", floorID, userID)
-		} else {
+		floor, exists := server.GetFloor(floorID)
+		if !exists || !floor.IsAvailable() {
 			log.Printf("Floor %d is busy, denying request from user %d", floorID, userID)
+			return false
 		}
-		return canGrant
+		log.Printf("Granting floor %d to user %d", floorID, userID)
+		return true
 	}
 
 	server.OnFloorGranted = func(floorID, userID, requestID uint16) {

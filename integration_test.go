@@ -12,7 +12,7 @@ func TestClientServerIntegration(t *testing.T) {
 	serverConfig := DefaultServerConfig("127.0.0.1:0", 1)
 	serverConfig.AutoGrant = true
 	server := NewServer(serverConfig)
-	server.AddFloor(1)
+	server.CreateFloor(1)
 
 	// Track events
 	var (
@@ -151,8 +151,8 @@ func TestMultipleFloors(t *testing.T) {
 	serverConfig := DefaultServerConfig("127.0.0.1:0", 1)
 	serverConfig.AutoGrant = true
 	server := NewServer(serverConfig)
-	server.AddFloor(1)
-	server.AddFloor(2)
+	server.CreateFloor(1)
+	server.CreateFloor(2)
 
 	// Start server
 	listener, err := Listen("127.0.0.1:0")
@@ -239,7 +239,7 @@ func TestFloorDenial(t *testing.T) {
 	serverConfig := DefaultServerConfig("127.0.0.1:0", 1)
 	serverConfig.AutoGrant = false
 	server := NewServer(serverConfig)
-	server.AddFloor(1)
+	server.CreateFloor(1)
 
 	// Deny all floor requests
 	server.OnFloorRequest = func(floorID, userID, requestID uint16) bool {

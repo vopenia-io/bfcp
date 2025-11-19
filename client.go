@@ -10,11 +10,12 @@ import (
 
 // ClientConfig holds configuration for the BFCP client
 type ClientConfig struct {
-	ServerAddress string
-	ConferenceID  uint32
-	UserID        uint16
-	EnableLogging bool
+	ServerAddress  string
+	ConferenceID   uint32
+	UserID         uint16
+	EnableLogging  bool
 	ConnectTimeout time.Duration
+	ConnectionRole string
 }
 
 // DefaultClientConfig returns a default client configuration
@@ -99,6 +100,7 @@ func (c *Client) Connect() error {
 	}
 
 	c.logf("✅ [BFCP] TCP connection established to %s", c.config.ServerAddress)
+
 	c.transport = transport
 	c.setState(StateConnected)
 	c.logf("🔄 [BFCP] State changed to: %s", StateConnected)
