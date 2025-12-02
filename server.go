@@ -448,11 +448,8 @@ func (sess *Session) handleGoodbye(msg *Message) {
 
 func (sess *Session) sendFloorStatus(req *Message, floorID, requestID uint16, status RequestStatus, queuePos uint8) {
 	response := NewMessage(PrimitiveFloorRequestStatus, req.ConferenceID, req.TransactionID, req.UserID)
-	response.AddFloorID(floorID)
-	if requestID > 0 {
-		response.AddFloorRequestID(requestID)
-	}
-	response.AddRequestStatus(status, queuePos)
+	// Use RFC 4582/8855 compliant FLOOR-REQUEST-INFORMATION grouped attribute
+	response.AddFloorRequestInformation(requestID, status, queuePos, floorID)
 	sess.send(response)
 }
 
@@ -482,6 +479,13 @@ func (s *Server) GrantFloor(floorID, userID uint16) error {
 	return floor.Grant()
 }
 
+// BroadcastFloorStatus sends a FloorRequestStatus message to all connected BFCP clients.
+// This is used to notify clients when the floor state changes (e.g., when a virtual
+// client takes or releases the floor).
+func (s *Server) BroadcastFloorStatus(userID uint16, floorID, requestID uint16, status RequestStatus, queuePos uint8) {
+	s.broadcastFloorStatus(userID, floorID, requestID, status, queuePos)
+}
+
 func (s *Server) broadcastFloorStatus(userID uint16, floorID, requestID uint16, status RequestStatus, queuePos uint8) {
 	s.mu.RLock()
 	sessions := make([]*Session, 0, len(s.sessions))
@@ -493,11 +497,8 @@ func (s *Server) broadcastFloorStatus(userID uint16, floorID, requestID uint16, 
 	for _, session := range sessions {
 		txID := uint16(s.nextTxID.Add(1))
 		msg := NewMessage(PrimitiveFloorRequestStatus, s.config.ConferenceID, txID, userID)
-		msg.AddFloorID(floorID)
-		if requestID > 0 {
-			msg.AddFloorRequestID(requestID)
-		}
-		msg.AddRequestStatus(status, queuePos)
+		// Use RFC 4582/8855 compliant FLOOR-REQUEST-INFORMATION grouped attribute
+		msg.AddFloorRequestInformation(requestID, status, queuePos, floorID)
 
 		session.send(msg)
 	}

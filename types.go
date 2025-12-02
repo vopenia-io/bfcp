@@ -8,7 +8,7 @@ import "fmt"
 const (
 	ProtocolVersionRFC4582 = 1 // RFC 4582 (original BFCP)
 	ProtocolVersionRFC8855 = 2 // RFC 8855 (updated BFCP)
-	ProtocolVersion        = ProtocolVersionRFC8855 // Default version for outgoing messages
+	ProtocolVersion        = ProtocolVersionRFC4582 // Default version for older Polycom compatibility
 )
 
 // Common field lengths
