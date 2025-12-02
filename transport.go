@@ -251,6 +251,31 @@ func (t *Transport) SendKeepaliveMessage(msg *Message) error {
 	return t.sendMessage(msg, true)
 }
 
+// SendRawData sends pre-encoded raw bytes over the transport
+func (t *Transport) SendRawData(data []byte) error {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	if t.closed {
+		log.Printf("❌ [BFCP Transport] Cannot send - transport is closed")
+		return fmt.Errorf("transport is closed")
+	}
+
+	// Set write deadline
+	if err := t.conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		log.Printf("❌ [BFCP Transport] Failed to set write deadline: %v", err)
+		return fmt.Errorf("failed to set write deadline: %w", err)
+	}
+
+	if _, err := t.conn.Write(data); err != nil {
+		log.Printf("❌ [BFCP Transport] Failed to write raw data: %v", err)
+		return fmt.Errorf("failed to write raw data: %w", err)
+	}
+
+	log.Printf("📤 [BFCP Transport] Sent raw data (%d bytes): %X", len(data), data)
+	return nil
+}
+
 // sendMessage sends a BFCP message over the transport with optional verbose flag
 func (t *Transport) sendMessage(msg *Message, isKeepalive bool) error {
 	t.mu.RLock()

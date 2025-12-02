@@ -116,127 +116,240 @@ func (m *Message) AddPriority(priority Priority) {
 	m.AddAttribute(AttrPriority, value)
 }
 
-// AddFloorRequestInformation adds a FLOOR-REQUEST-INFORMATION grouped attribute
-// containing the floor request ID, overall status, and floor-specific statuses.
-// Per RFC 4582/8855, FloorRequestStatus MUST contain this grouped attribute.
+// buildSimpleAttr builds a simple (non-grouped) BFCP attribute with proper RFC 4582 encoding.
+// Length is in 32-bit words and includes header. Attribute is padded to 4-byte boundary.
+func buildSimpleAttr(attrType uint8, mandatory bool, value []byte) []byte {
+	header := attrType << 1 // shift type up, bit0 = M
+	if mandatory {
+		header |= 0x01
+	}
+	// base length: 2-byte header + len(value)
+	l := 2 + len(value)
+	// pad to 4-byte boundary
+	pad := (4 - (l % 4)) % 4
+	total := l + pad
+
+	out := make([]byte, total)
+	out[0] = header
+	out[1] = byte(total / 4) // length in 32-bit words
+	copy(out[2:], value)
+	// padding is already zero
+	return out
+}
+
+// buildGroupedAttr builds a grouped BFCP attribute from already-encoded children.
+// Length is in 32-bit words and includes header. Attribute is padded to 4-byte boundary.
+// NOTE: This is for simple grouped attributes WITHOUT a header ID field.
+// For attributes like FLOOR-REQUEST-INFORMATION, FLOOR-REQUEST-STATUS, OVERALL-REQUEST-STATUS
+// that have a 2-byte header ID, use buildGroupedAttrWithHeaderID instead.
+func buildGroupedAttr(attrType uint8, mandatory bool, children [][]byte) []byte {
+	header := attrType << 1
+	if mandatory {
+		header |= 0x01
+	}
+	// 2-byte header + sum(children)
+	size := 2
+	for _, c := range children {
+		size += len(c)
+	}
+	// pad to 4-byte boundary
+	pad := (4 - (size % 4)) % 4
+	total := size + pad
+
+	out := make([]byte, total)
+	out[0] = header
+	out[1] = byte(total / 4) // length in 32-bit words
+	off := 2
+	for _, c := range children {
+		copy(out[off:], c)
+		off += len(c)
+	}
+	// padding zeroed by make
+	return out
+}
+
+// buildGroupedAttrWithHeaderID builds a grouped BFCP attribute with a 2-byte header ID.
+// Per RFC 8855, certain grouped attributes have a 2-byte ID field directly in their header,
+// BEFORE any sub-attributes:
+//   - FLOOR-REQUEST-INFORMATION (type 31): Floor Request ID
+//   - FLOOR-REQUEST-STATUS (type 33): Floor ID
+//   - OVERALL-REQUEST-STATUS (type 35): Floor Request ID
 //
-// RFC 4582 FLOOR-REQUEST-INFORMATION format (Figure 23):
+// Structure:
 //
 //	0                   1                   2                   3
 //	0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//	|  Type | M | R |     Length    |     Header ID (16-bit)        |
+//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//	|           sub-attributes...                                   |
 //
-// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-// |0 0 0 1 1 1 1|M|    Length     |       Floor Request ID        |
-// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-// |                                                               |
-// /                  (Nested attributes follow)                   /
+// Length is in 32-bit words and includes Type+Length+HeaderID+children.
+func buildGroupedAttrWithHeaderID(attrType uint8, mandatory bool, headerID uint16, children [][]byte) []byte {
+	header := attrType << 1
+	if mandatory {
+		header |= 0x01
+	}
+	// 2-byte TLV header + 2-byte header ID + sum(children)
+	size := 4
+	for _, c := range children {
+		size += len(c)
+	}
+	// pad to 4-byte boundary
+	pad := (4 - (size % 4)) % 4
+	total := size + pad
+
+	out := make([]byte, total)
+	out[0] = header
+	out[1] = byte(total / 4) // length in 32-bit words
+	// Header ID in big-endian
+	out[2] = byte(headerID >> 8)
+	out[3] = byte(headerID & 0xFF)
+	off := 4
+	for _, c := range children {
+		copy(out[off:], c)
+		off += len(c)
+	}
+	// padding zeroed by make
+	return out
+}
+
+// BuildFloorStatusMessage builds a complete FloorStatus message with proper RFC 8855 encoding.
+// This bypasses the normal Message.Encode() path to ensure correct encoding.
 //
-// The Floor Request ID is part of the first 4-byte header word (bytes 2-3),
-// NOT a separate field with padding. Nested attributes start immediately after.
+// Structure per RFC 8855:
+//
+//	FloorStatus:
+//	  FLOOR-ID (top-level, simple attr)
+//	  FLOOR-REQUEST-INFORMATION (grouped with Floor Request ID in header):
+//	    OVERALL-REQUEST-STATUS (grouped with Floor Request ID in header):
+//	      REQUEST-STATUS
+//	    FLOOR-REQUEST-STATUS (grouped with Floor ID in header):
+//	      REQUEST-STATUS
+//
+// Key difference from old code: FLOOR-REQUEST-INFORMATION, FLOOR-REQUEST-STATUS, and
+// OVERALL-REQUEST-STATUS have 2-byte header IDs directly in their TLV structure,
+// BEFORE any sub-attributes.
+func BuildFloorStatusMessage(confID uint32, txID uint16, userID uint16, floorID uint16, requestID uint16, status RequestStatus) []byte {
+	// 1) FLOOR-ID (top-level, mandatory, simple attribute)
+	floorIDVal := make([]byte, 2)
+	binary.BigEndian.PutUint16(floorIDVal, floorID)
+	floorIDAttr := buildSimpleAttr(uint8(AttrFloorID), true, floorIDVal)
+
+	// 2) REQUEST-STATUS (child of OVERALL-REQUEST-STATUS and FLOOR-REQUEST-STATUS)
+	// REQUEST-STATUS value: 2 bytes - status in bits, queue position
+	// Per RFC 8855, REQUEST-STATUS is only 2 bytes (status + queue pos)
+	reqStatusVal := make([]byte, 2)
+	reqStatusVal[0] = uint8(status) // status value directly
+	reqStatusVal[1] = 0             // queue position = 0
+	requestStatusAttr := buildSimpleAttr(uint8(AttrRequestStatus), false, reqStatusVal)
+
+	// 3) OVERALL-REQUEST-STATUS (grouped with Floor Request ID in header)
+	// Per RFC 8855, OVERALL-REQUEST-STATUS has Floor Request ID (2 bytes) in header
+	// Contains: REQUEST-STATUS sub-attribute
+	overallReqStatusAttr := buildGroupedAttrWithHeaderID(uint8(AttrOverallRequestStatus), false, requestID, [][]byte{
+		requestStatusAttr,
+	})
+
+	// 4) FLOOR-REQUEST-STATUS (grouped with Floor ID in header)
+	// Per RFC 8855, FLOOR-REQUEST-STATUS has Floor ID (2 bytes) in header
+	// Contains: REQUEST-STATUS sub-attribute (no nested FLOOR-ID needed - it's in header)
+	floorReqStatusAttr := buildGroupedAttrWithHeaderID(uint8(AttrFloorRequestStatus), false, floorID, [][]byte{
+		requestStatusAttr, // Same status for this floor
+	})
+
+	// 5) FLOOR-REQUEST-INFORMATION (grouped with Floor Request ID in header)
+	// Per RFC 8855, FLOOR-REQUEST-INFORMATION has Floor Request ID (2 bytes) in header
+	// Contains: OVERALL-REQUEST-STATUS, FLOOR-REQUEST-STATUS
+	floorReqInfoAttr := buildGroupedAttrWithHeaderID(uint8(AttrFloorRequestInfo), true, requestID, [][]byte{
+		overallReqStatusAttr,
+		floorReqStatusAttr,
+	})
+
+	// Top-level payload: FLOOR-ID + FLOOR-REQUEST-INFORMATION
+	payload := append(floorIDAttr, floorReqInfoAttr...)
+
+	// Build complete message with common header
+	// Header is 12 bytes, length is in 32-bit words
+	lengthWords := uint16(len(payload) / 4)
+	buf := make([]byte, 12+len(payload))
+
+	// Byte 0: Version(3 bits) + Reserved(5 bits) - Version 1 = 0x20
+	buf[0] = 0x20 // Version 1
+
+	// Byte 1: Primitive (FloorStatus = 8)
+	buf[1] = uint8(PrimitiveFloorStatus)
+
+	// Bytes 2-3: PayloadLength in 32-bit words
+	binary.BigEndian.PutUint16(buf[2:4], lengthWords)
+
+	// Bytes 4-7: ConferenceID
+	binary.BigEndian.PutUint32(buf[4:8], confID)
+
+	// Bytes 8-9: TransactionID
+	binary.BigEndian.PutUint16(buf[8:10], txID)
+
+	// Bytes 10-11: UserID
+	binary.BigEndian.PutUint16(buf[10:12], userID)
+
+	// Copy payload
+	copy(buf[12:], payload)
+
+	return buf
+}
+
+// AddFloorRequestInformationRFC4582 adds a FLOOR-REQUEST-INFORMATION grouped attribute
+// with proper RFC 8855 encoding (length in 32-bit words, header IDs).
+//
+// Structure per RFC 8855:
+//
+//	FLOOR-REQUEST-INFORMATION (grouped with Floor Request ID in header):
+//	  OVERALL-REQUEST-STATUS (grouped with Floor Request ID in header):
+//	    REQUEST-STATUS
+//	  FLOOR-REQUEST-STATUS (grouped with Floor ID in header):
+//	    REQUEST-STATUS
+func (m *Message) AddFloorRequestInformationRFC4582(requestID uint16, status RequestStatus, floorID uint16) {
+	// Build the nested structure from inside out
+
+	// 1) REQUEST-STATUS (2 bytes: status + queue position)
+	reqStatusVal := make([]byte, 2)
+	reqStatusVal[0] = uint8(status) // status value directly
+	reqStatusVal[1] = 0             // queue position = 0
+	requestStatusAttr := buildSimpleAttr(uint8(AttrRequestStatus), false, reqStatusVal)
+
+	// 2) OVERALL-REQUEST-STATUS (grouped with Floor Request ID in header)
+	overallReqStatusAttr := buildGroupedAttrWithHeaderID(uint8(AttrOverallRequestStatus), false, requestID, [][]byte{
+		requestStatusAttr,
+	})
+
+	// 3) FLOOR-REQUEST-STATUS (grouped with Floor ID in header)
+	floorReqStatusAttr := buildGroupedAttrWithHeaderID(uint8(AttrFloorRequestStatus), false, floorID, [][]byte{
+		requestStatusAttr,
+	})
+
+	// 4) FLOOR-REQUEST-INFORMATION (grouped with Floor Request ID in header)
+	floorReqInfoAttr := buildGroupedAttrWithHeaderID(uint8(AttrFloorRequestInfo), true, requestID, [][]byte{
+		overallReqStatusAttr,
+		floorReqStatusAttr,
+	})
+
+	// Add as raw bytes (already properly encoded with length in words)
+	m.Attributes = append(m.Attributes, Attribute{
+		Type:   AttrFloorRequestInfo,
+		Length: uint8(len(floorReqInfoAttr)), // Store raw length for internal use
+		Value:  floorReqInfoAttr,             // Store full encoded attribute
+	})
+}
+
+// AddFloorRequestInformation adds a FLOOR-REQUEST-INFORMATION grouped attribute
+// containing the floor request ID, overall status, and floor-specific statuses.
+// DEPRECATED: Use AddFloorRequestInformationRFC4582 for proper RFC 4582 encoding.
 func (m *Message) AddFloorRequestInformation(requestID uint16, status RequestStatus, queuePos uint8, floorIDs ...uint16) {
-	// Build the grouped attribute content
-	// NOTE: Floor Request ID is placed in bytes 2-3 of the attribute by Encode()
-	// via special handling, so we only include nested attributes in content here.
-	var content []byte
-
-	// 1. Floor Request ID (16-bit) - goes in bytes 2-3 of the 4-byte header
-	// This is handled specially - we put it first, no padding after it
-	reqIDBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(reqIDBytes, requestID)
-	content = append(content, reqIDBytes...)
-
-	// 2. OVERALL-REQUEST-STATUS (type 18) containing REQUEST-STATUS
-	// Starts immediately after Floor Request ID (no padding!)
-	overallStatus := m.buildOverallRequestStatus(status, queuePos)
-	content = append(content, overallStatus...)
-
-	// 3. FLOOR-REQUEST-STATUS (type 17) for each floor
-	for _, floorID := range floorIDs {
-		floorStatus := m.buildFloorRequestStatus(floorID)
-		content = append(content, floorStatus...)
+	if len(floorIDs) > 0 {
+		// Use new RFC 4582 compliant encoding
+		m.AddFloorRequestInformationRFC4582(requestID, status, floorIDs[0])
+		return
 	}
-
-	// Pad to 4-byte boundary for the entire grouped attribute content
-	// This is the ONLY place we add padding for the grouped attribute.
-	// Nested attributes do NOT have individual padding.
-	if padding := len(content) % 4; padding != 0 {
-		content = append(content, make([]byte, 4-padding)...)
-	}
-
-	m.AddAttribute(AttrFloorRequestInfo, content)
-}
-
-// buildOverallRequestStatus builds an OVERALL-REQUEST-STATUS sub-attribute (type 18)
-// containing a nested REQUEST-STATUS attribute.
-func (m *Message) buildOverallRequestStatus(status RequestStatus, queuePos uint8) []byte {
-	// Nested REQUEST-STATUS attribute: type(1) + len(1) + value(2) = 4 bytes
-	// For v1: length includes header (4), for v2: length is value only (2)
-	statusLen := uint8(2)
-	if m.Version == ProtocolVersionRFC4582 {
-		statusLen = 4 // v1: includes Type+Length
-	}
-	statusAttr := []byte{
-		uint8(AttrRequestStatus), // Type 5
-		statusLen,                // Length
-		uint8(status),            // Status
-		queuePos,                 // Queue position
-	}
-
-	// OVERALL-REQUEST-STATUS: type(1) + len(1) + content(4)
-	// For v1: length includes header (6), for v2: length is value only (4)
-	overallLen := uint8(len(statusAttr))
-	if m.Version == ProtocolVersionRFC4582 {
-		overallLen = uint8(len(statusAttr) + 2) // v1: includes Type+Length
-	}
-	attr := []byte{
-		uint8(AttrOverallRequestStatus), // Type 18
-		overallLen,                       // Length
-	}
-	attr = append(attr, statusAttr...)
-
-	// NOTE: Do NOT pad nested attributes inside grouped attributes.
-	// The parent grouped attribute handles 4-byte alignment for its total content.
-	// Padding here would cause Length vs Content mismatch (Length excludes padding per RFC 4582).
-
-	return attr
-}
-
-// buildFloorRequestStatus builds a FLOOR-REQUEST-STATUS sub-attribute (type 17)
-// containing a nested FLOOR-ID attribute.
-func (m *Message) buildFloorRequestStatus(floorID uint16) []byte {
-	// FLOOR-ID value: 2 bytes
-	floorIDBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(floorIDBytes, floorID)
-
-	// Nested FLOOR-ID attribute: type(1) + len(1) + value(2) = 4 bytes
-	// For v1: length includes header (4), for v2: length is value only (2)
-	floorLen := uint8(2)
-	if m.Version == ProtocolVersionRFC4582 {
-		floorLen = 4 // v1: includes Type+Length
-	}
-	floorAttr := []byte{
-		uint8(AttrFloorID), // Type 2
-		floorLen,           // Length
-	}
-	floorAttr = append(floorAttr, floorIDBytes...)
-
-	// FLOOR-REQUEST-STATUS: type(1) + len(1) + content(4)
-	// For v1: length includes header (6), for v2: length is value only (4)
-	statusLen := uint8(len(floorAttr))
-	if m.Version == ProtocolVersionRFC4582 {
-		statusLen = uint8(len(floorAttr) + 2) // v1: includes Type+Length
-	}
-	attr := []byte{
-		uint8(AttrFloorRequestStatus), // Type 17
-		statusLen,                      // Length
-	}
-	attr = append(attr, floorAttr...)
-
-	// NOTE: Do NOT pad nested attributes inside grouped attributes.
-	// The parent grouped attribute handles 4-byte alignment for its total content.
-	// Padding here would cause Length vs Content mismatch (Length excludes padding per RFC 4582).
-
-	return attr
 }
 
 // AddGroupedAttribute adds a grouped attribute containing nested attributes
@@ -246,8 +359,9 @@ func (m *Message) AddGroupedAttribute(attrType AttributeType, subAttributes []At
 	var value []byte
 	for _, attr := range subAttributes {
 		// Each sub-attribute: Type(1) + Length(1) + Value(Length)
+		// RFC 4582/8855: Type byte = (type << 1) | mandatory_bit
 		attrBytes := make([]byte, 2+len(attr.Value))
-		attrBytes[0] = uint8(attr.Type)
+		attrBytes[0] = (uint8(attr.Type) << 1) | 0x01 // Encode type with mandatory bit
 		attrBytes[1] = attr.Length
 		copy(attrBytes[2:], attr.Value)
 
@@ -382,8 +496,11 @@ func (m *Message) Encode() ([]byte, error) {
 	// Encode attributes
 	offset := CommonHeaderLength
 	for _, attr := range m.Attributes {
-		// Type (1 byte)
-		buf[offset] = uint8(attr.Type)
+		// Type (1 byte) - RFC 4582/8855: 7-bit type + 1-bit mandatory flag
+		// Format: | Type (7 bits) | M (1 bit) |
+		// Encode as: (type << 1) | mandatory_bit
+		// All our attributes are mandatory (M=1) for now
+		buf[offset] = (uint8(attr.Type) << 1) | 0x01
 		offset++
 
 		// Length (1 byte)
@@ -463,8 +580,12 @@ func Decode(data []byte) (*Message, error) {
 			return nil, fmt.Errorf("incomplete attribute header at offset %d", offset)
 		}
 
-		// Type (1 byte)
-		attrType := AttributeType(data[offset])
+		// Type (1 byte) - RFC 4582/8855: 7-bit type + 1-bit mandatory flag
+		// Format: | Type (7 bits) | M (1 bit) |
+		// Decode as: type = byte >> 1, mandatory = byte & 0x01
+		typeByte := data[offset]
+		attrType := AttributeType(typeByte >> 1)
+		// mandatory := (typeByte & 0x01) != 0 // Not used yet, but available
 		offset++
 
 		// Length (1 byte)

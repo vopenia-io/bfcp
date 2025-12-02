@@ -519,6 +519,12 @@ func (sess *Session) send(msg *Message) {
 	}
 }
 
+func (sess *Session) sendRaw(data []byte) {
+	if err := sess.Transport.SendRawData(data); err != nil {
+		sess.Server.logf("Failed to send raw data to %s: %v", sess.Transport.RemoteAddr(), err)
+	}
+}
+
 func (s *Server) GrantFloor(floorID, userID uint16) error {
 	floor, exists := s.GetFloor(floorID)
 	if !exists {
@@ -576,26 +582,30 @@ func (s *Server) broadcastFloorState(floorID uint16, beneficiaryID uint16, statu
 
 	for _, session := range sessions {
 		txID := uint16(s.nextTxID.Add(1))
-		// Use FloorStatus with proper RFC 4582 structure:
-		// FloorStatus = (COMMON-HEADER) *1(FLOOR-ID) *(FLOOR-REQUEST-INFORMATION)
-		// FLOOR-REQUEST-INFORMATION contains nested OVERALL-REQUEST-STATUS and FLOOR-REQUEST-STATUS
-		msg := NewMessage(PrimitiveFloorStatus, s.config.ConferenceID, txID, session.StateMachine.UserID)
 
-		// Add top-level FLOOR-ID (allowed per RFC 4582 Section 5.3.8)
-		msg.AddFloorID(floorID)
-
-		// Add FLOOR-REQUEST-INFORMATION grouped attribute with proper nested structure
-		// This builds: FLOOR-REQUEST-INFORMATION containing:
-		//   - OVERALL-REQUEST-STATUS containing REQUEST-STATUS
-		//   - FLOOR-REQUEST-STATUS containing FLOOR-ID
+		// Use BuildFloorStatusMessage for proper RFC 4582 encoding with:
+		// - Length in 32-bit words
+		// - Correct nested attribute structure:
+		//   FLOOR-ID (top-level)
+		//   FLOOR-REQUEST-INFORMATION:
+		//     FLOOR-REQUEST-ID
+		//     FLOOR-REQUEST-STATUS:
+		//       FLOOR-ID
+		//       REQUEST-STATUS
 		requestID := uint16(1) // Synthetic request ID for virtual client notification
-		msg.AddFloorRequestInformation(requestID, status, 0, floorID)
+		encoded := BuildFloorStatusMessage(
+			s.config.ConferenceID,
+			txID,
+			session.StateMachine.UserID,
+			floorID,
+			requestID,
+			status,
+		)
 
-		encoded, _ := msg.Encode()
 		s.logf("FloorStatus to userID=%d: floorID=%d, status=%s, hex(%d bytes): %X",
 			session.StateMachine.UserID, floorID, status, len(encoded), encoded)
 
-		session.send(msg)
+		session.sendRaw(encoded)
 	}
 }
 
