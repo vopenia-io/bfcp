@@ -156,6 +156,13 @@ func (m *Message) AddFloorRequestInformation(requestID uint16, status RequestSta
 		content = append(content, floorStatus...)
 	}
 
+	// Pad to 4-byte boundary for the entire grouped attribute content
+	// This is the ONLY place we add padding for the grouped attribute.
+	// Nested attributes do NOT have individual padding.
+	if padding := len(content) % 4; padding != 0 {
+		content = append(content, make([]byte, 4-padding)...)
+	}
+
 	m.AddAttribute(AttrFloorRequestInfo, content)
 }
 
@@ -187,10 +194,9 @@ func (m *Message) buildOverallRequestStatus(status RequestStatus, queuePos uint8
 	}
 	attr = append(attr, statusAttr...)
 
-	// Pad to 4-byte boundary if needed
-	if padding := len(attr) % 4; padding != 0 {
-		attr = append(attr, make([]byte, 4-padding)...)
-	}
+	// NOTE: Do NOT pad nested attributes inside grouped attributes.
+	// The parent grouped attribute handles 4-byte alignment for its total content.
+	// Padding here would cause Length vs Content mismatch (Length excludes padding per RFC 4582).
 
 	return attr
 }
@@ -226,10 +232,9 @@ func (m *Message) buildFloorRequestStatus(floorID uint16) []byte {
 	}
 	attr = append(attr, floorAttr...)
 
-	// Pad to 4-byte boundary if needed
-	if padding := len(attr) % 4; padding != 0 {
-		attr = append(attr, make([]byte, 4-padding)...)
-	}
+	// NOTE: Do NOT pad nested attributes inside grouped attributes.
+	// The parent grouped attribute handles 4-byte alignment for its total content.
+	// Padding here would cause Length vs Content mismatch (Length excludes padding per RFC 4582).
 
 	return attr
 }

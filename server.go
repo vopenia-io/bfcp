@@ -46,6 +46,11 @@ type Server struct {
 	OnClientConnect    func(remoteAddr string, userID uint16)
 	OnClientDisconnect func(remoteAddr string, userID uint16)
 	OnError            func(error)
+
+	// OnMessageIn is called for every incoming BFCP message (for logging)
+	OnMessageIn func(remote string, primitive string, transactionID, conferenceID uint32, userID, floorID uint16)
+	// OnMessageOut is called for every outgoing BFCP message (for logging)
+	OnMessageOut func(remote string, primitive string, transactionID, conferenceID uint32, userID, floorID uint16)
 }
 
 type Session struct {
@@ -96,14 +101,17 @@ func (s *Server) ReleaseFloor(floorID uint16) {
 	s.logf("Released floor %d", floorID)
 }
 
-func (s *Server) ListenAndServe() error {
+// Listen binds the BFCP server to its configured address synchronously.
+// After this returns successfully, Addr() will return the bound address.
+// Call Serve() to start accepting connections.
+func (s *Server) Listen() error {
 	listener, err := Listen(s.config.Address)
 	if err != nil {
 		return fmt.Errorf("failed to create listener: %w", err)
 	}
 
 	s.listener = listener
-	s.logf("BFCP server listening on %s (Conference ID: %d)", s.config.Address, s.config.ConferenceID)
+	s.logf("BFCP server listening on %s (Conference ID: %d)", s.listener.Addr(), s.config.ConferenceID)
 
 	listener.OnConnection = s.handleConnection
 	listener.OnError = func(err error) {
@@ -114,8 +122,22 @@ func (s *Server) ListenAndServe() error {
 		}
 	}
 
-	listener.Start()
+	return nil
+}
 
+// Serve starts accepting connections. This should be called after Listen().
+// This method is non-blocking - it starts the accept loop in a goroutine.
+func (s *Server) Serve() {
+	if s.listener != nil {
+		s.listener.Start()
+	}
+}
+
+func (s *Server) ListenAndServe() error {
+	if err := s.Listen(); err != nil {
+		return err
+	}
+	s.Serve()
 	select {}
 }
 
@@ -183,6 +205,19 @@ func (s *Server) handleConnection(transport *Transport) {
 func (sess *Session) handleMessage(msg *Message) {
 	sess.StateMachine.UpdateActivity()
 	sess.Server.logf("Received %s from %s (TxID: %d)", msg.Primitive, sess.Transport.RemoteAddr(), msg.TransactionID)
+
+	// Call OnMessageIn callback for structured logging
+	if sess.Server.OnMessageIn != nil {
+		floorID, _ := msg.GetFloorID()
+		sess.Server.OnMessageIn(
+			sess.Transport.RemoteAddr().String(),
+			msg.Primitive.String(),
+			uint32(msg.TransactionID),
+			msg.ConferenceID,
+			msg.UserID,
+			floorID,
+		)
+	}
 
 	switch msg.Primitive {
 	case PrimitiveHello:
@@ -468,6 +503,19 @@ func (sess *Session) send(msg *Message) {
 		sess.Server.logf("Failed to send %s to %s: %v", msg.Primitive, sess.Transport.RemoteAddr(), err)
 	} else {
 		sess.Server.logf("Sent %s to %s (TxID: %d)", msg.Primitive, sess.Transport.RemoteAddr(), msg.TransactionID)
+
+		// Call OnMessageOut callback for structured logging
+		if sess.Server.OnMessageOut != nil {
+			floorID, _ := msg.GetFloorID()
+			sess.Server.OnMessageOut(
+				sess.Transport.RemoteAddr().String(),
+				msg.Primitive.String(),
+				uint32(msg.TransactionID),
+				msg.ConferenceID,
+				msg.UserID,
+				floorID,
+			)
+		}
 	}
 }
 
@@ -499,6 +547,53 @@ func (s *Server) broadcastFloorStatus(userID uint16, floorID, requestID uint16, 
 		msg := NewMessage(PrimitiveFloorRequestStatus, s.config.ConferenceID, txID, userID)
 		// Use RFC 4582/8855 compliant FLOOR-REQUEST-INFORMATION grouped attribute
 		msg.AddFloorRequestInformation(requestID, status, queuePos, floorID)
+
+		session.send(msg)
+	}
+}
+
+// BroadcastFloorState sends a FloorStatus message to all connected BFCP clients.
+// Unlike FloorRequestStatus (which responds to a specific floor request), FloorStatus
+// is a general notification about floor state. This is appropriate when notifying
+// clients about floor changes that don't correspond to their own requests (e.g.,
+// when a virtual client takes the floor).
+//
+// Per RFC 8855, FloorStatus contains:
+// - FLOOR-ID: the floor being reported on
+// - BENEFICIARY-ID: optional, indicates who holds the floor (if granted)
+// - REQUEST-STATUS: the current status (Granted, Released, etc.)
+func (s *Server) BroadcastFloorState(floorID uint16, beneficiaryID uint16, status RequestStatus) {
+	s.broadcastFloorState(floorID, beneficiaryID, status)
+}
+
+func (s *Server) broadcastFloorState(floorID uint16, beneficiaryID uint16, status RequestStatus) {
+	s.mu.RLock()
+	sessions := make([]*Session, 0, len(s.sessions))
+	for _, session := range s.sessions {
+		sessions = append(sessions, session)
+	}
+	s.mu.RUnlock()
+
+	for _, session := range sessions {
+		txID := uint16(s.nextTxID.Add(1))
+		// Use FloorStatus with proper RFC 4582 structure:
+		// FloorStatus = (COMMON-HEADER) *1(FLOOR-ID) *(FLOOR-REQUEST-INFORMATION)
+		// FLOOR-REQUEST-INFORMATION contains nested OVERALL-REQUEST-STATUS and FLOOR-REQUEST-STATUS
+		msg := NewMessage(PrimitiveFloorStatus, s.config.ConferenceID, txID, session.StateMachine.UserID)
+
+		// Add top-level FLOOR-ID (allowed per RFC 4582 Section 5.3.8)
+		msg.AddFloorID(floorID)
+
+		// Add FLOOR-REQUEST-INFORMATION grouped attribute with proper nested structure
+		// This builds: FLOOR-REQUEST-INFORMATION containing:
+		//   - OVERALL-REQUEST-STATUS containing REQUEST-STATUS
+		//   - FLOOR-REQUEST-STATUS containing FLOOR-ID
+		requestID := uint16(1) // Synthetic request ID for virtual client notification
+		msg.AddFloorRequestInformation(requestID, status, 0, floorID)
+
+		encoded, _ := msg.Encode()
+		s.logf("FloorStatus to userID=%d: floorID=%d, status=%s, hex(%d bytes): %X",
+			session.StateMachine.UserID, floorID, status, len(encoded), encoded)
 
 		session.send(msg)
 	}
