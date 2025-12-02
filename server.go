@@ -483,8 +483,8 @@ func (sess *Session) handleGoodbye(msg *Message) {
 
 func (sess *Session) sendFloorStatus(req *Message, floorID, requestID uint16, status RequestStatus, queuePos uint8) {
 	response := NewMessage(PrimitiveFloorRequestStatus, req.ConferenceID, req.TransactionID, req.UserID)
-	// Use RFC 4582/8855 compliant FLOOR-REQUEST-INFORMATION grouped attribute
-	response.AddFloorRequestInformation(requestID, status, queuePos, floorID)
+	// Use RFC 4582/8855 compliant FLOOR-REQUEST-INFORMATION grouped attribute with proper 2-byte header IDs
+	response.AddFloorRequestInformationRFC4582(requestID, status, floorID)
 	sess.send(response)
 }
 
@@ -551,8 +551,8 @@ func (s *Server) broadcastFloorStatus(userID uint16, floorID, requestID uint16, 
 	for _, session := range sessions {
 		txID := uint16(s.nextTxID.Add(1))
 		msg := NewMessage(PrimitiveFloorRequestStatus, s.config.ConferenceID, txID, userID)
-		// Use RFC 4582/8855 compliant FLOOR-REQUEST-INFORMATION grouped attribute
-		msg.AddFloorRequestInformation(requestID, status, queuePos, floorID)
+		// Use RFC 4582/8855 compliant FLOOR-REQUEST-INFORMATION grouped attribute with proper 2-byte header IDs
+		msg.AddFloorRequestInformationRFC4582(requestID, status, floorID)
 
 		session.send(msg)
 	}

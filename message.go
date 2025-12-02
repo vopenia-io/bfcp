@@ -27,6 +27,7 @@ type Attribute struct {
 	Type   AttributeType
 	Length uint8  // Length in bytes (not including Type and Length fields)
 	Value  []byte // Actual attribute data
+	RawTLV bool   // If true, Value contains a complete pre-encoded TLV (Type+Length+Value+padding)
 }
 
 // NewMessage creates a new BFCP message with the given primitive
@@ -116,8 +117,9 @@ func (m *Message) AddPriority(priority Priority) {
 	m.AddAttribute(AttrPriority, value)
 }
 
-// buildSimpleAttr builds a simple (non-grouped) BFCP attribute with proper RFC 4582 encoding.
-// Length is in 32-bit words and includes header. Attribute is padded to 4-byte boundary.
+// buildSimpleAttr builds a simple (non-grouped) BFCP attribute with proper RFC 4582 v1 encoding.
+// Per RFC 4582, Length is in bytes and includes Type+Length+Value+padding.
+// Attribute is padded to 4-byte boundary.
 func buildSimpleAttr(attrType uint8, mandatory bool, value []byte) []byte {
 	header := attrType << 1 // shift type up, bit0 = M
 	if mandatory {
@@ -131,14 +133,15 @@ func buildSimpleAttr(attrType uint8, mandatory bool, value []byte) []byte {
 
 	out := make([]byte, total)
 	out[0] = header
-	out[1] = byte(total / 4) // length in 32-bit words
+	out[1] = byte(total) // RFC 4582 v1: length in bytes (includes Type+Length+Value+padding)
 	copy(out[2:], value)
 	// padding is already zero
 	return out
 }
 
 // buildGroupedAttr builds a grouped BFCP attribute from already-encoded children.
-// Length is in 32-bit words and includes header. Attribute is padded to 4-byte boundary.
+// Per RFC 4582 v1, Length is in bytes and includes Type+Length+children+padding.
+// Attribute is padded to 4-byte boundary.
 // NOTE: This is for simple grouped attributes WITHOUT a header ID field.
 // For attributes like FLOOR-REQUEST-INFORMATION, FLOOR-REQUEST-STATUS, OVERALL-REQUEST-STATUS
 // that have a 2-byte header ID, use buildGroupedAttrWithHeaderID instead.
@@ -158,7 +161,7 @@ func buildGroupedAttr(attrType uint8, mandatory bool, children [][]byte) []byte 
 
 	out := make([]byte, total)
 	out[0] = header
-	out[1] = byte(total / 4) // length in 32-bit words
+	out[1] = byte(total) // RFC 4582 v1: length in bytes (includes Type+Length+children+padding)
 	off := 2
 	for _, c := range children {
 		copy(out[off:], c)
@@ -184,7 +187,7 @@ func buildGroupedAttr(attrType uint8, mandatory bool, children [][]byte) []byte 
 //	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 //	|           sub-attributes...                                   |
 //
-// Length is in 32-bit words and includes Type+Length+HeaderID+children.
+// Length is in bytes and includes Type+Length+HeaderID+children (RFC 4582 v1 format).
 func buildGroupedAttrWithHeaderID(attrType uint8, mandatory bool, headerID uint16, children [][]byte) []byte {
 	header := attrType << 1
 	if mandatory {
@@ -201,7 +204,7 @@ func buildGroupedAttrWithHeaderID(attrType uint8, mandatory bool, headerID uint1
 
 	out := make([]byte, total)
 	out[0] = header
-	out[1] = byte(total / 4) // length in 32-bit words
+	out[1] = byte(total) // RFC 4582 v1: length in bytes (includes Type+Length+HeaderID+children+padding)
 	// Header ID in big-endian
 	out[2] = byte(headerID >> 8)
 	out[3] = byte(headerID & 0xFF)
@@ -334,10 +337,12 @@ func (m *Message) AddFloorRequestInformationRFC4582(requestID uint16, status Req
 	})
 
 	// Add as raw bytes (already properly encoded with length in words)
+	// RawTLV=true tells Encode() to copy this as-is without re-encoding
 	m.Attributes = append(m.Attributes, Attribute{
 		Type:   AttrFloorRequestInfo,
 		Length: uint8(len(floorReqInfoAttr)), // Store raw length for internal use
 		Value:  floorReqInfoAttr,             // Store full encoded attribute
+		RawTLV: true,                         // This is a complete pre-encoded TLV
 	})
 }
 
@@ -442,26 +447,32 @@ func (m *Message) GetErrorInfo() (string, bool) {
 
 // Encode serializes the BFCP message to bytes according to RFC 8855 Section 5
 // Message format:
-//  0                   1                   2                   3
-//  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-// |Ver|  Resv |P|  Primitive |            Length                   |
-// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-// |         ConferenceID          |        TransactionID          |
-// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-// |           UserID              |       (Start of Attributes)   |
-// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//
+//	 0                   1                   2                   3
+//	 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//	|Ver|  Resv |P|  Primitive |            Length                   |
+//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//	|         ConferenceID          |        TransactionID          |
+//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//	|           UserID              |       (Start of Attributes)   |
+//	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 func (m *Message) Encode() ([]byte, error) {
 	// Calculate total attribute length
 	attrLength := 0
 	for _, attr := range m.Attributes {
-		// Each attribute: Type(1) + Length(1) + Value(Length) + padding to 4-byte boundary
-		attrLen := 2 + int(attr.Length)
-		// Pad to 4-byte boundary
-		if padding := attrLen % 4; padding != 0 {
-			attrLen += 4 - padding
+		if attr.RawTLV {
+			// RawTLV: Value contains the complete pre-encoded TLV (already padded)
+			attrLength += len(attr.Value)
+		} else {
+			// Normal attribute: Type(1) + Length(1) + Value(Length) + padding to 4-byte boundary
+			attrLen := 2 + int(attr.Length)
+			// Pad to 4-byte boundary
+			if padding := attrLen % 4; padding != 0 {
+				attrLen += 4 - padding
+			}
+			attrLength += attrLen
 		}
-		attrLength += attrLen
 	}
 
 	// PayloadLength is in 4-byte words (excluding common header)
@@ -496,30 +507,37 @@ func (m *Message) Encode() ([]byte, error) {
 	// Encode attributes
 	offset := CommonHeaderLength
 	for _, attr := range m.Attributes {
-		// Type (1 byte) - RFC 4582/8855: 7-bit type + 1-bit mandatory flag
-		// Format: | Type (7 bits) | M (1 bit) |
-		// Encode as: (type << 1) | mandatory_bit
-		// All our attributes are mandatory (M=1) for now
-		buf[offset] = (uint8(attr.Type) << 1) | 0x01
-		offset++
+		if attr.RawTLV {
+			// RawTLV: Copy the pre-encoded TLV as-is (no re-encoding)
+			copy(buf[offset:], attr.Value)
+			offset += len(attr.Value)
+		} else {
+			// Normal attribute encoding
+			// Type (1 byte) - RFC 4582/8855: 7-bit type + 1-bit mandatory flag
+			// Format: | Type (7 bits) | M (1 bit) |
+			// Encode as: (type << 1) | mandatory_bit
+			// All our attributes are mandatory (M=1) for now
+			buf[offset] = (uint8(attr.Type) << 1) | 0x01
+			offset++
 
-		// Length (1 byte)
-		// RFC 4582 v1: Length includes Type(1) + Length(1) + Value
-		// RFC 8855 v2: Length is only the value size
-		lengthField := attr.Length
-		if m.Version == ProtocolVersionRFC4582 {
-			lengthField = attr.Length + 2 // Add 2 for Type+Length header
-		}
-		buf[offset] = lengthField
-		offset++
+			// Length (1 byte)
+			// RFC 4582 v1: Length includes Type(1) + Length(1) + Value
+			// RFC 8855 v2: Length is only the value size
+			lengthField := attr.Length
+			if m.Version == ProtocolVersionRFC4582 {
+				lengthField = attr.Length + 2 // Add 2 for Type+Length header
+			}
+			buf[offset] = lengthField
+			offset++
 
-		// Value (Length bytes)
-		copy(buf[offset:], attr.Value)
-		offset += int(attr.Length)
+			// Value (Length bytes)
+			copy(buf[offset:], attr.Value)
+			offset += int(attr.Length)
 
-		// Padding to 4-byte boundary
-		if padding := (2 + int(attr.Length)) % 4; padding != 0 {
-			offset += 4 - padding
+			// Padding to 4-byte boundary
+			if padding := (2 + int(attr.Length)) % 4; padding != 0 {
+				offset += 4 - padding
+			}
 		}
 	}
 
