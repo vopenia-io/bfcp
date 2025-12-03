@@ -4,20 +4,20 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vopenia/bfcp"
+	"github.com/vopenia-io/bfcp"
 )
 
 // TestClientCreation tests basic client creation
 func TestClientCreation(t *testing.T) {
 	tests := []struct {
-		name        string
-		id          string
-		serverAddr  string
+		name         string
+		id           string
+		serverAddr   string
 		conferenceID uint32
-		userID      uint16
-		callbacks   Callbacks
-		timeout     time.Duration
-		wantErr     bool
+		userID       uint16
+		callbacks    Callbacks
+		timeout      time.Duration
+		wantErr      bool
 	}{
 		{
 			name:         "valid client",

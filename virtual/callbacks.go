@@ -1,6 +1,6 @@
 package virtual
 
-import "github.com/vopenia/bfcp"
+import "github.com/vopenia-io/bfcp"
 
 // Callbacks defines the interface for handling virtual client events.
 // Applications implement this interface to respond to floor control events,
@@ -109,15 +109,15 @@ type NoOpCallbacks struct{}
 // Ensure NoOpCallbacks implements Callbacks interface
 var _ Callbacks = (*NoOpCallbacks)(nil)
 
-func (NoOpCallbacks) OnFloorGranted(floorID uint16, requestID uint16)                             {}
+func (NoOpCallbacks) OnFloorGranted(floorID uint16, requestID uint16) {}
 func (NoOpCallbacks) OnFloorDenied(floorID uint16, requestID uint16, errorCode bfcp.ErrorCode, errorInfo string) {
 }
-func (NoOpCallbacks) OnFloorRevoked(floorID uint16, requestID uint16)                     {}
-func (NoOpCallbacks) OnFloorReleased(floorID uint16, requestID uint16)                    {}
+func (NoOpCallbacks) OnFloorRevoked(floorID uint16, requestID uint16)                         {}
+func (NoOpCallbacks) OnFloorReleased(floorID uint16, requestID uint16)                        {}
 func (NoOpCallbacks) OnQueuePositionChanged(floorID uint16, requestID uint16, position uint8) {}
 func (NoOpCallbacks) OnFloorStatusChanged(floorID uint16, requestID uint16, status bfcp.RequestStatus) {
 }
-func (NoOpCallbacks) OnConnected()               {}
+func (NoOpCallbacks) OnConnected()                {}
 func (NoOpCallbacks) OnDisconnected(reason error) {}
 func (NoOpCallbacks) OnReconnecting(attempt int)  {}
 func (NoOpCallbacks) OnError(err error)           {}

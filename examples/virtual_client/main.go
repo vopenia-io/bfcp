@@ -7,8 +7,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/vopenia/bfcp"
-	"github.com/vopenia/bfcp/virtual"
+	"github.com/vopenia-io/bfcp"
+	"github.com/vopenia-io/bfcp/virtual"
 )
 
 // MyCallbacks implements the virtual.Callbacks interface to handle

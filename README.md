@@ -27,7 +27,7 @@ This library implements:
 ## Installation
 
 ```bash
-go get github.com/vopenia/bfcp
+go get github.com/vopenia-io/bfcp
 ```
 
 ## Quick Start
@@ -39,7 +39,7 @@ package main
 
 import (
     "log"
-    "github.com/vopenia/bfcp"
+    "github.com/vopenia-io/bfcp"
 )
 
 func main() {
@@ -75,7 +75,7 @@ package main
 
 import (
     "log"
-    "github.com/vopenia/bfcp"
+    "github.com/vopenia-io/bfcp"
 )
 
 func main() {

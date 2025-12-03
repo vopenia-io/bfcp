@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document summarizes the implementation of the virtual BFCP client package for the https://github.com/vopenia/bfcp library. The virtual client abstraction allows non-BFCP systems (like WebRTC) to participate in BFCP floor control through a proxy pattern.
+This document summarizes the implementation of the virtual BFCP client package for the https://github.com/vopenia-io/bfcp library. The virtual client abstraction allows non-BFCP systems (like WebRTC) to participate in BFCP floor control through a proxy pattern.
 
 ## Deliverables
 
@@ -186,7 +186,7 @@ Specific error types defined:
 
 ```
 === Test Summary ===
-Package: github.com/vopenia/bfcp/virtual
+Package: github.com/vopenia-io/bfcp/virtual
 
 Unit Tests: PASS (26 tests, 0 failures)
 Integration Tests: SKIP (requires BFCP server)

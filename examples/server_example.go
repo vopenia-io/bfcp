@@ -6,7 +6,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/vopenia/bfcp"
+	"github.com/vopenia-io/bfcp"
 )
 
 func main() {

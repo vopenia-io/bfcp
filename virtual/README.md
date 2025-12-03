@@ -27,7 +27,7 @@ This package extends the standard BFCP library to support scenarios where the ac
 ## Installation
 
 ```bash
-go get github.com/vopenia/bfcp/virtual
+go get github.com/vopenia-io/bfcp/virtual
 ```
 
 ## Quick Start
@@ -39,8 +39,8 @@ package main
 
 import (
     "log"
-    "github.com/vopenia/bfcp"
-    "github.com/vopenia/bfcp/virtual"
+    "github.com/vopenia-io/bfcp"
+    "github.com/vopenia-io/bfcp/virtual"
 )
 
 // Implement callbacks
@@ -409,4 +409,4 @@ See the main BFCP library LICENSE file.
 ## Support
 
 For issues, questions, or contributions, please visit:
-https://github.com/vopenia/bfcp
+https://github.com/vopenia-io/bfcp

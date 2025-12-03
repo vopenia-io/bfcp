@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vopenia/bfcp"
+	"github.com/vopenia-io/bfcp"
 )
 
 // TestIntegrationWithMockServer tests virtual client with a real BFCP server
@@ -273,16 +273,16 @@ func testManagerIntegration(t *testing.T) {
 
 // testCallbacks is a helper for integration tests
 type testCallbacks struct {
-	onFloorGranted           func(floorID, requestID uint16)
-	onFloorDenied            func(floorID, requestID uint16, errorCode bfcp.ErrorCode, errorInfo string)
-	onFloorRevoked           func(floorID, requestID uint16)
-	onFloorReleased          func(floorID, requestID uint16)
-	onQueuePositionChanged   func(floorID, requestID uint16, position uint8)
-	onFloorStatusChanged     func(floorID, requestID uint16, status bfcp.RequestStatus)
-	onConnected              func()
-	onDisconnected           func(reason error)
-	onReconnecting           func(attempt int)
-	onError                  func(err error)
+	onFloorGranted         func(floorID, requestID uint16)
+	onFloorDenied          func(floorID, requestID uint16, errorCode bfcp.ErrorCode, errorInfo string)
+	onFloorRevoked         func(floorID, requestID uint16)
+	onFloorReleased        func(floorID, requestID uint16)
+	onQueuePositionChanged func(floorID, requestID uint16, position uint8)
+	onFloorStatusChanged   func(floorID, requestID uint16, status bfcp.RequestStatus)
+	onConnected            func()
+	onDisconnected         func(reason error)
+	onReconnecting         func(attempt int)
+	onError                func(err error)
 }
 
 func (c *testCallbacks) OnFloorGranted(floorID, requestID uint16) {

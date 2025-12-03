@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/vopenia/bfcp"
+	"github.com/vopenia-io/bfcp"
 )
 
 func main() {

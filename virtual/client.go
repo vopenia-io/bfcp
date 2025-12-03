@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/vopenia/bfcp"
+	"github.com/vopenia-io/bfcp"
 )
 
 // Common errors
@@ -30,10 +30,10 @@ var (
 // and state management automatically.
 type Client struct {
 	// Core identifiers
-	id           string   // Unique identifier for this virtual client
-	userID       uint16   // BFCP User ID assigned to this client
-	conferenceID uint32   // Conference ID this client belongs to
-	serverAddr   string   // BFCP server address
+	id           string // Unique identifier for this virtual client
+	userID       uint16 // BFCP User ID assigned to this client
+	conferenceID uint32 // Conference ID this client belongs to
+	serverAddr   string // BFCP server address
 
 	// BFCP client
 	client *bfcp.Client
@@ -41,7 +41,7 @@ type Client struct {
 	// State tracking
 	activeRequests map[uint16]*FloorRequest // requestID -> request details
 	heldFloors     map[uint16]uint16        // floorID -> requestID
-	requestTimeout time.Duration             // Timeout for floor requests
+	requestTimeout time.Duration            // Timeout for floor requests
 
 	// Callbacks
 	callbacks Callbacks
@@ -70,12 +70,12 @@ type FloorRequest struct {
 
 // ClientStatus represents the current status of a virtual client
 type ClientStatus struct {
-	ID              string      // Client identifier
-	UserID          uint16      // BFCP User ID
-	Connected       bool        // Connection status
-	ActiveFloors    []uint16    // List of currently held floor IDs
-	PendingRequests []uint16    // List of pending request IDs
-	LastActivity    time.Time   // Last activity timestamp
+	ID              string    // Client identifier
+	UserID          uint16    // BFCP User ID
+	Connected       bool      // Connection status
+	ActiveFloors    []uint16  // List of currently held floor IDs
+	PendingRequests []uint16  // List of pending request IDs
+	LastActivity    time.Time // Last activity timestamp
 }
 
 // RequestOption is a functional option for configuring floor requests
@@ -111,12 +111,13 @@ func WithBeneficiary(userID uint16) RequestOption {
 // New creates a new virtual BFCP client.
 //
 // Parameters:
-//   id - Unique identifier for this client (e.g., "webrtc-user-123")
-//   serverAddr - BFCP server address (e.g., "localhost:5070")
-//   conferenceID - Conference ID to join
-//   userID - BFCP User ID for this client
-//   callbacks - Event callbacks (use NoOpCallbacks if none needed)
-//   timeout - Timeout for floor requests (use 0 for default 30 seconds)
+//
+//	id - Unique identifier for this client (e.g., "webrtc-user-123")
+//	serverAddr - BFCP server address (e.g., "localhost:5070")
+//	conferenceID - Conference ID to join
+//	userID - BFCP User ID for this client
+//	callbacks - Event callbacks (use NoOpCallbacks if none needed)
+//	timeout - Timeout for floor requests (use 0 for default 30 seconds)
 //
 // The client is created in a disconnected state. Call Connect() to establish
 // the connection to the BFCP server.
