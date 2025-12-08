@@ -163,10 +163,7 @@ func (c *Client) Connect() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Create BFCP client
 	config := bfcp.DefaultClientConfig(c.serverAddr, c.conferenceID, c.userID)
-	config.EnableLogging = false
-
 	client := bfcp.NewClient(config)
 
 	// Set up callbacks to translate BFCP events to virtual client events

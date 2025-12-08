@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"log"
 )
 
 // Message represents a BFCP protocol message with common header and attributes
@@ -584,14 +583,8 @@ func Decode(data []byte) (*Message, error) {
 			len(data)-CommonHeaderLength, expectedPayloadSize)
 	}
 
-	log.Printf("🔍 [Decode] Parsing %s message: version=%d, payloadLength=%d words (%d bytes), confID=%d, txID=%d, userID=%d, totalBytes=%d",
-		msg.Primitive, msg.Version, msg.PayloadLength, expectedPayloadSize, msg.ConferenceID, msg.TransactionID, msg.UserID, len(data))
-
-	// Parse attributes
 	offset := CommonHeaderLength
 	endOffset := CommonHeaderLength + expectedPayloadSize
-
-	log.Printf("🔍 [Decode] Starting attribute parsing: offset=%d, endOffset=%d", offset, endOffset)
 
 	for offset < endOffset {
 		if offset+2 > endOffset {
@@ -610,33 +603,21 @@ func Decode(data []byte) (*Message, error) {
 		attrLength := data[offset]
 		offset++
 
-		// RFC 4582 (v1) vs RFC 8855 (v2) difference:
-		// - v1: Length includes Type+Length header (total attribute size)
-		// - v2: Length is only the value size (excludes Type+Length header)
+		// RFC 4582 (v1) vs RFC 8855 (v2) length interpretation differs:
+		// v1: Length includes Type+Length header, v2: Length is value size only
 		var valueLength int
 		if msg.Version == ProtocolVersionRFC4582 {
-			// v1: Length includes Type(1) + Length(1) = subtract 2
 			if attrLength < 2 {
-				log.Printf("❌ [Decode] ERROR: RFC 4582 attribute length too small: %d (must be >= 2)", attrLength)
-				log.Printf("📋 [Decode] Full message hex dump (%d bytes): %X", len(data), data)
-				return nil, fmt.Errorf("invalid RFC 4582 attribute length: %d", attrLength)
+				return nil, fmt.Errorf("invalid RFC 4582 attribute length: %d (must be >= 2)", attrLength)
 			}
 			valueLength = int(attrLength) - 2
 		} else {
-			// v2: Length is the value size directly
 			valueLength = int(attrLength)
 		}
 
-		log.Printf("🔍 [Decode] Parsing attribute: type=%s(%d), length=%d bytes (v%d format), valueLength=%d, offset=%d, endOffset=%d, remaining=%d",
-			attrType, attrType, attrLength, msg.Version, valueLength, offset, endOffset, endOffset-offset)
-
-		// Value (valueLength bytes)
 		if offset+valueLength > endOffset {
-			log.Printf("❌ [Decode] ERROR: Attribute value exceeds bounds: need %d bytes, have %d bytes remaining",
-				valueLength, endOffset-offset)
-			// Dump the message for debugging
-			log.Printf("📋 [Decode] Full message hex dump (%d bytes): %X", len(data), data)
-			return nil, fmt.Errorf("attribute value exceeds message bounds at offset %d", offset)
+			return nil, fmt.Errorf("attribute value exceeds message bounds at offset %d: need %d bytes, have %d",
+				offset, valueLength, endOffset-offset)
 		}
 
 		value := make([]byte, valueLength)

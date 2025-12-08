@@ -2,7 +2,6 @@ package bfcp
 
 import (
 	"fmt"
-	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,7 +12,7 @@ type ClientConfig struct {
 	ServerAddress  string
 	ConferenceID   uint32
 	UserID         uint16
-	EnableLogging  bool
+	Logger         Logger
 	ConnectTimeout time.Duration
 	ConnectionRole string
 }
@@ -24,7 +23,7 @@ func DefaultClientConfig(serverAddr string, conferenceID uint32, userID uint16) 
 		ServerAddress:  serverAddr,
 		ConferenceID:   conferenceID,
 		UserID:         userID,
-		EnableLogging:  true,
+		Logger:         NopLogger{},
 		ConnectTimeout: 10 * time.Second,
 	}
 }
@@ -34,21 +33,17 @@ type Client struct {
 	config    *ClientConfig
 	transport *Transport
 
-	// State
 	state      SessionState
 	stateMu    sync.RWMutex
 	connected  atomic.Bool
 	nextTxID   atomic.Uint32
 
-	// Active floor requests
-	activeRequests map[uint16]*ActiveFloorRequest // FloorID -> ActiveFloorRequest
+	activeRequests map[uint16]*ActiveFloorRequest
 	requestsMu     sync.RWMutex
 
-	// Pending responses (waiting for server response)
-	pendingResponses map[uint16]chan *Message // TransactionID -> response channel
+	pendingResponses map[uint16]chan *Message
 	pendingMu        sync.RWMutex
 
-	// Event callbacks
 	OnConnected      func()
 	OnDisconnected   func()
 	OnFloorGranted   func(floorID, requestID uint16)
@@ -87,34 +82,32 @@ func NewClient(config *ClientConfig) *Client {
 // Connect establishes a connection to the BFCP server
 func (c *Client) Connect() error {
 	if c.connected.Load() {
-		c.logf("⚠️ Already connected to BFCP server")
+		c.log().Warnw("bfcp.client.already_connected", nil)
 		return fmt.Errorf("already connected")
 	}
 
-	c.logf("🔌 [BFCP] Attempting to connect to %s", c.config.ServerAddress)
+	c.log().Debugw("bfcp.client.connecting", "addr", c.config.ServerAddress)
 
-	transport, err := Dial(c.config.ServerAddress)
+	transport, err := DialWithLogger(c.config.ServerAddress, c.config.Logger)
 	if err != nil {
-		c.logf("❌ [BFCP] Failed to connect to %s: %v", c.config.ServerAddress, err)
+		c.log().Errorw("bfcp.client.connect_failed", err, "addr", c.config.ServerAddress)
 		return fmt.Errorf("failed to connect: %w", err)
 	}
 
-	c.logf("✅ [BFCP] TCP connection established to %s", c.config.ServerAddress)
+	c.log().Debugw("bfcp.client.tcp_connected", "addr", c.config.ServerAddress)
 
 	c.transport = transport
 	c.setState(StateConnected)
-	c.logf("🔄 [BFCP] State changed to: %s", StateConnected)
 
-	// Set up transport callbacks
 	transport.OnMessage = c.handleMessage
 	transport.OnError = func(err error) {
-		c.logf("Transport error: %v", err)
+		c.log().Warnw("bfcp.client.transport_error", err)
 		if c.OnError != nil {
 			c.OnError(err)
 		}
 	}
 	transport.OnClose = func() {
-		c.logf("Connection closed")
+		c.log().Debugw("bfcp.client.connection_closed")
 		c.connected.Store(false)
 		c.setState(StateDisconnected)
 		if c.OnDisconnected != nil {
@@ -122,15 +115,12 @@ func (c *Client) Connect() error {
 		}
 	}
 
-	// Start reading messages
-	c.logf("📖 [BFCP] Starting transport read loop")
 	transport.Start()
 	c.connected.Store(true)
 
-	c.logf("✅ [BFCP] Client connected and ready (ConferenceID: %d, UserID: %d)", c.config.ConferenceID, c.config.UserID)
+	c.log().Infow("bfcp.client.ready", "confID", c.config.ConferenceID, "userID", c.config.UserID)
 
 	if c.OnConnected != nil {
-		c.logf("📞 [BFCP] Calling OnConnected callback")
 		c.OnConnected()
 	}
 
@@ -143,14 +133,12 @@ func (c *Client) Disconnect() error {
 		return nil
 	}
 
-	c.logf("Disconnecting from %s", c.config.ServerAddress)
+	c.log().Debugw("bfcp.client.disconnecting", "addr", c.config.ServerAddress)
 
-	// Send Goodbye
 	if err := c.Goodbye(); err != nil {
-		c.logf("Failed to send Goodbye: %v", err)
+		c.log().Warnw("bfcp.client.goodbye_failed", err)
 	}
 
-	// Close transport
 	if c.transport != nil {
 		return c.transport.Close()
 	}
@@ -161,15 +149,13 @@ func (c *Client) Disconnect() error {
 // Hello sends a Hello message to the server
 func (c *Client) Hello() error {
 	if !c.connected.Load() {
-		c.logf("❌ [BFCP] Cannot send Hello - not connected")
 		return fmt.Errorf("not connected")
 	}
 
 	txID := c.nextTransactionID()
-	c.logf("👋 [BFCP] Sending Hello message (TxID: %d)", txID)
+	c.log().Debugw("bfcp.client.hello_sending", "txID", txID)
 	msg := NewMessage(PrimitiveHello, c.config.ConferenceID, txID, c.config.UserID)
 
-	// Add supported primitives
 	supportedPrimitives := []Primitive{
 		PrimitiveFloorRequest,
 		PrimitiveFloorRelease,
@@ -184,7 +170,6 @@ func (c *Client) Hello() error {
 	}
 	msg.AddSupportedPrimitives(supportedPrimitives)
 
-	// Add supported attributes
 	supportedAttributes := []AttributeType{
 		AttrBeneficiaryID,
 		AttrFloorID,
@@ -198,84 +183,72 @@ func (c *Client) Hello() error {
 	}
 	msg.AddSupportedAttributes(supportedAttributes)
 
-	// Send and wait for HelloAck
-	c.logf("⏳ [BFCP] Waiting for HelloAck (timeout: 5s)")
 	response, err := c.sendAndWait(msg, 5*time.Second)
 	if err != nil {
-		c.logf("❌ [BFCP] Hello handshake failed: %v", err)
+		c.log().Warnw("bfcp.client.hello_failed", err, "txID", txID)
 		return fmt.Errorf("failed to send Hello: %w", err)
 	}
 
 	if response.Primitive != PrimitiveHelloAck {
-		c.logf("❌ [BFCP] Expected HelloAck, got %s", response.Primitive)
+		c.log().Warnw("bfcp.client.hello_unexpected_response", nil, "expected", "HelloAck", "got", response.Primitive.String())
 		return fmt.Errorf("expected HelloAck, got %s", response.Primitive)
 	}
 
 	c.setState(StateWaitFloorRequest)
-	c.logf("✅ [BFCP] Hello handshake completed - ready to request floor")
-	c.logf("🔄 [BFCP] State changed to: %s", StateWaitFloorRequest)
+	c.log().Infow("bfcp.client.hello_completed")
 	return nil
 }
 
 // RequestFloor requests control of a floor
 func (c *Client) RequestFloor(floorID uint16, beneficiaryID uint16, priority Priority) (uint16, error) {
 	if !c.connected.Load() {
-		c.logf("❌ [BFCP] Cannot request floor - not connected")
 		return 0, fmt.Errorf("not connected")
 	}
 
 	txID := c.nextTransactionID()
-	c.logf("🎤 [BFCP] Requesting floor (FloorID: %d, BeneficiaryID: %d, Priority: %d, TxID: %d)", floorID, beneficiaryID, priority, txID)
+	c.log().Debugw("bfcp.client.floor_requesting", "floorID", floorID, "beneficiaryID", beneficiaryID, "priority", priority, "txID", txID)
 	msg := NewMessage(PrimitiveFloorRequest, c.config.ConferenceID, txID, c.config.UserID)
 
 	msg.AddFloorID(floorID)
 	if beneficiaryID > 0 {
 		msg.AddBeneficiaryID(beneficiaryID)
-		c.logf("   ➜ Added BENEFICIARY-ID: %d", beneficiaryID)
 	}
 	if priority > 0 {
 		msg.AddPriority(priority)
-		c.logf("   ➜ Added PRIORITY: %d", priority)
 	}
 
-	// Send and wait for FloorRequestStatus
-	c.logf("⏳ [BFCP] Waiting for FloorRequestStatus (timeout: 5s)")
 	response, err := c.sendAndWait(msg, 5*time.Second)
 	if err != nil {
-		c.logf("❌ [BFCP] Floor request failed: %v", err)
+		c.log().Warnw("bfcp.client.floor_request_failed", err, "floorID", floorID, "txID", txID)
 		return 0, fmt.Errorf("failed to request floor: %w", err)
 	}
 
 	if response.Primitive == PrimitiveError {
 		errorCode, _ := response.GetErrorCode()
 		errorInfo, _ := response.GetErrorInfo()
-		c.logf("❌ [BFCP] Server returned error: %s - %s", errorCode, errorInfo)
+		c.log().Warnw("bfcp.client.floor_request_error", nil, "floorID", floorID, "errorCode", errorCode.String(), "errorInfo", errorInfo)
 		return 0, fmt.Errorf("floor request failed: %s - %s", errorCode, errorInfo)
 	}
 
 	if response.Primitive != PrimitiveFloorRequestStatus {
-		c.logf("❌ [BFCP] Expected FloorRequestStatus, got %s", response.Primitive)
+		c.log().Warnw("bfcp.client.floor_request_unexpected_response", nil, "floorID", floorID, "expected", "FloorRequestStatus", "got", response.Primitive.String())
 		return 0, fmt.Errorf("expected FloorRequestStatus, got %s", response.Primitive)
 	}
 
-	c.logf("📩 [BFCP] Received FloorRequestStatus response")
-
-	// Extract floor request ID and status
 	requestID, ok := response.GetFloorRequestID()
 	if !ok {
-		c.logf("❌ [BFCP] Response missing FLOOR-REQUEST-ID attribute")
+		c.log().Warnw("bfcp.client.floor_request_missing_id", nil, "floorID", floorID)
 		return 0, fmt.Errorf("missing FLOOR-REQUEST-ID in response")
 	}
-	c.logf("   ➜ Floor Request ID: %d", requestID)
 
 	status, queuePos, ok := response.GetRequestStatus()
 	if !ok {
-		c.logf("❌ [BFCP] Response missing REQUEST-STATUS attribute")
+		c.log().Warnw("bfcp.client.floor_request_missing_status", nil, "floorID", floorID, "requestID", requestID)
 		return 0, fmt.Errorf("missing REQUEST-STATUS in response")
 	}
-	c.logf("   ➜ Request Status: %s (Queue Position: %d)", status, queuePos)
 
-	// Track the request
+	c.log().Debugw("bfcp.client.floor_request_status", "floorID", floorID, "requestID", requestID, "status", status.String(), "queuePos", queuePos)
+
 	c.requestsMu.Lock()
 	c.activeRequests[floorID] = &ActiveFloorRequest{
 		FloorID:        floorID,
@@ -287,29 +260,23 @@ func (c *Client) RequestFloor(floorID uint16, beneficiaryID uint16, priority Pri
 	}
 	c.requestsMu.Unlock()
 
-	c.logf("📝 [BFCP] Floor %d request tracked (RequestID: %d, Status: %s)", floorID, requestID, status)
-
 	if status == RequestStatusGranted {
 		c.setState(StateFloorGranted)
-		c.logf("✅ [BFCP] Floor %d GRANTED immediately! 🎉", floorID)
-		c.logf("🔄 [BFCP] State changed to: %s", StateFloorGranted)
 		c.requestsMu.Lock()
 		if req, exists := c.activeRequests[floorID]; exists {
 			req.GrantedAt = time.Now()
-			c.logf("   ➜ Grant time recorded: %s", req.GrantedAt.Format("15:04:05.000"))
 		}
 		c.requestsMu.Unlock()
 
+		c.log().Infow("bfcp.client.floor_granted", "floorID", floorID, "requestID", requestID)
 		if c.OnFloorGranted != nil {
-			c.logf("📞 [BFCP] Calling OnFloorGranted callback (FloorID: %d, RequestID: %d)", floorID, requestID)
 			c.OnFloorGranted(floorID, requestID)
 		}
 	} else if status == RequestStatusPending || status == RequestStatusAccepted {
 		c.setState(StateFloorRequested)
-		c.logf("⏳ [BFCP] Floor %d request %s - waiting for grant", floorID, status)
-		c.logf("🔄 [BFCP] State changed to: %s", StateFloorRequested)
+		c.log().Debugw("bfcp.client.floor_pending", "floorID", floorID, "requestID", requestID, "status", status.String())
 	} else {
-		c.logf("⚠️ [BFCP] Floor %d request status: %s", floorID, status)
+		c.log().Debugw("bfcp.client.floor_status", "floorID", floorID, "requestID", requestID, "status", status.String())
 	}
 
 	return requestID, nil
@@ -330,30 +297,31 @@ func (c *Client) ReleaseFloor(floorID uint16) error {
 	}
 
 	txID := c.nextTransactionID()
+	c.log().Debugw("bfcp.client.floor_releasing", "floorID", floorID, "requestID", activeReq.FloorRequestID, "txID", txID)
 	msg := NewMessage(PrimitiveFloorRelease, c.config.ConferenceID, txID, c.config.UserID)
 
 	msg.AddFloorID(floorID)
 	msg.AddFloorRequestID(activeReq.FloorRequestID)
 
-	// Send and wait for FloorRequestStatus
 	response, err := c.sendAndWait(msg, 5*time.Second)
 	if err != nil {
+		c.log().Warnw("bfcp.client.floor_release_failed", err, "floorID", floorID)
 		return fmt.Errorf("failed to release floor: %w", err)
 	}
 
 	if response.Primitive == PrimitiveError {
 		errorCode, _ := response.GetErrorCode()
 		errorInfo, _ := response.GetErrorInfo()
+		c.log().Warnw("bfcp.client.floor_release_error", nil, "floorID", floorID, "errorCode", errorCode.String(), "errorInfo", errorInfo)
 		return fmt.Errorf("floor release failed: %s - %s", errorCode, errorInfo)
 	}
 
-	// Remove from active requests
 	c.requestsMu.Lock()
 	delete(c.activeRequests, floorID)
 	c.requestsMu.Unlock()
 
 	c.setState(StateFloorReleased)
-	c.logf("Floor %d released", floorID)
+	c.log().Infow("bfcp.client.floor_released", "floorID", floorID)
 
 	if c.OnFloorReleased != nil {
 		c.OnFloorReleased(floorID)
@@ -388,32 +356,25 @@ func (c *Client) Goodbye() error {
 
 	txID := c.nextTransactionID()
 	msg := NewMessage(PrimitiveGoodbye, c.config.ConferenceID, txID, c.config.UserID)
-
-	// Send without waiting for response (best effort)
 	return c.send(msg)
 }
 
 // handleMessage processes incoming messages from the server
 func (c *Client) handleMessage(msg *Message) {
-	c.logf("Received %s (TxID: %d)", msg.Primitive, msg.TransactionID)
+	c.log().Debugw("bfcp.client.msg_received", "primitive", msg.Primitive.String(), "txID", msg.TransactionID)
 
-	// Check if this is a response to a pending request
 	c.pendingMu.RLock()
 	respChan, isPending := c.pendingResponses[msg.TransactionID]
 	c.pendingMu.RUnlock()
 
 	if isPending {
-		// Try to send to waiting goroutine (non-blocking)
 		select {
 		case respChan <- msg:
-			// Successfully sent to waiting goroutine, done
 			return
 		default:
-			// Channel full (already has a response), fall through to handle as unsolicited
 		}
 	}
 
-	// Handle unsolicited messages (server-initiated)
 	switch msg.Primitive {
 	case PrimitiveFloorRequestStatus:
 		c.handleFloorRequestStatus(msg)
@@ -422,7 +383,7 @@ func (c *Client) handleMessage(msg *Message) {
 	case PrimitiveError:
 		c.handleError(msg)
 	default:
-		c.logf("Unexpected message: %s", msg.Primitive)
+		c.log().Debugw("bfcp.client.unexpected_msg", "primitive", msg.Primitive.String())
 	}
 }
 
@@ -430,20 +391,19 @@ func (c *Client) handleMessage(msg *Message) {
 func (c *Client) handleFloorRequestStatus(msg *Message) {
 	floorID, ok := msg.GetFloorID()
 	if !ok {
-		c.logf("FloorRequestStatus missing FLOOR-ID")
+		c.log().Warnw("bfcp.client.floor_status_missing_id", nil)
 		return
 	}
 
 	requestID, _ := msg.GetFloorRequestID()
 	status, _, ok := msg.GetRequestStatus()
 	if !ok {
-		c.logf("FloorRequestStatus missing REQUEST-STATUS")
+		c.log().Warnw("bfcp.client.floor_status_missing_status", nil, "floorID", floorID)
 		return
 	}
 
-	c.logf("Floor %d status update: %s (RequestID: %d)", floorID, status, requestID)
+	c.log().Debugw("bfcp.client.floor_status_update", "floorID", floorID, "requestID", requestID, "status", status.String())
 
-	// Update active request
 	c.requestsMu.Lock()
 	if req, exists := c.activeRequests[floorID]; exists {
 		req.Status = status
@@ -453,7 +413,6 @@ func (c *Client) handleFloorRequestStatus(msg *Message) {
 	}
 	c.requestsMu.Unlock()
 
-	// Handle status changes
 	switch status {
 	case RequestStatusGranted:
 		c.setState(StateFloorGranted)
@@ -482,13 +441,13 @@ func (c *Client) handleFloorRequestStatus(msg *Message) {
 func (c *Client) handleFloorStatus(msg *Message) {
 	floorID, ok := msg.GetFloorID()
 	if !ok {
-		c.logf("FloorStatus missing FLOOR-ID")
+		c.log().Warnw("bfcp.client.floor_status_missing_floor_id", nil)
 		return
 	}
 
 	status, _, ok := msg.GetRequestStatus()
 	if !ok {
-		c.logf("FloorStatus missing REQUEST-STATUS")
+		c.log().Warnw("bfcp.client.floor_status_missing_request_status", nil, "floorID", floorID)
 		return
 	}
 
@@ -502,7 +461,7 @@ func (c *Client) handleError(msg *Message) {
 	errorCode, _ := msg.GetErrorCode()
 	errorInfo, _ := msg.GetErrorInfo()
 
-	c.logf("Received error: %s - %s", errorCode, errorInfo)
+	c.log().Warnw("bfcp.client.error_received", nil, "errorCode", errorCode.String(), "errorInfo", errorInfo)
 
 	if c.OnError != nil {
 		c.OnError(fmt.Errorf("BFCP error: %s - %s", errorCode, errorInfo))
@@ -511,14 +470,12 @@ func (c *Client) handleError(msg *Message) {
 
 // sendAndWait sends a message and waits for a response
 func (c *Client) sendAndWait(msg *Message, timeout time.Duration) (*Message, error) {
-	// Create response channel
 	respChan := make(chan *Message, 1)
 
 	c.pendingMu.Lock()
 	c.pendingResponses[msg.TransactionID] = respChan
 	c.pendingMu.Unlock()
 
-	// Clean up on return
 	defer func() {
 		c.pendingMu.Lock()
 		delete(c.pendingResponses, msg.TransactionID)
@@ -526,12 +483,10 @@ func (c *Client) sendAndWait(msg *Message, timeout time.Duration) (*Message, err
 		close(respChan)
 	}()
 
-	// Send message
 	if err := c.send(msg); err != nil {
 		return nil, err
 	}
 
-	// Wait for response
 	select {
 	case response := <-respChan:
 		return response, nil
@@ -550,7 +505,7 @@ func (c *Client) send(msg *Message) error {
 		return fmt.Errorf("failed to send message: %w", err)
 	}
 
-	c.logf("Sent %s (TxID: %d)", msg.Primitive, msg.TransactionID)
+	c.log().Debugw("bfcp.client.msg_sent", "primitive", msg.Primitive.String(), "txID", msg.TransactionID)
 	return nil
 }
 
@@ -590,9 +545,9 @@ func (c *Client) nextTransactionID() uint16 {
 	return uint16(c.nextTxID.Add(1))
 }
 
-// logf logs a message if logging is enabled
-func (c *Client) logf(format string, args ...interface{}) {
-	if c.config.EnableLogging {
-		log.Printf("[BFCP Client] "+format, args...)
+func (c *Client) log() Logger {
+	if c.config.Logger != nil {
+		return c.config.Logger
 	}
+	return NopLogger{}
 }

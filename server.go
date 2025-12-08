@@ -2,7 +2,6 @@ package bfcp
 
 import (
 	"fmt"
-	"log"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -10,12 +9,12 @@ import (
 )
 
 type ServerConfig struct {
-	Address          string
-	ConferenceID     uint32
-	AutoGrant        bool
-	MaxFloors        int
-	SessionTimeout   int
-	EnableLogging    bool
+	Address        string
+	ConferenceID   uint32
+	AutoGrant      bool
+	MaxFloors      int
+	SessionTimeout int
+	Logger         Logger
 }
 
 func DefaultServerConfig(address string, conferenceID uint32) *ServerConfig {
@@ -25,7 +24,7 @@ func DefaultServerConfig(address string, conferenceID uint32) *ServerConfig {
 		AutoGrant:      true,
 		MaxFloors:      10,
 		SessionTimeout: 300,
-		EnableLogging:  true,
+		Logger:         NopLogger{},
 	}
 }
 
@@ -81,7 +80,7 @@ func (s *Server) CreateFloor(floorID uint16) *FloorStateMachine {
 
 	floor := NewFloorStateMachine(floorID, s.config.ConferenceID)
 	s.floors[floorID] = floor
-	s.logf("Created floor %d", floorID)
+	s.logger().Debugw("bfcp.floor.created", "floorID", floorID)
 	return floor
 }
 
@@ -98,7 +97,7 @@ func (s *Server) ReleaseFloor(floorID uint16) {
 	defer s.mu.Unlock()
 
 	delete(s.floors, floorID)
-	s.logf("Released floor %d", floorID)
+	s.logger().Debugw("bfcp.floor.released", "floorID", floorID)
 }
 
 // Listen binds the BFCP server to its configured address synchronously.
@@ -111,14 +110,14 @@ func (s *Server) Listen() error {
 	}
 
 	s.listener = listener
-	s.logf("BFCP server listening on %s (Conference ID: %d)", s.listener.Addr(), s.config.ConferenceID)
+	s.logger().Infow("bfcp.server.listening", "addr", s.listener.Addr().String(), "confID", s.config.ConferenceID)
 
 	listener.OnConnection = s.handleConnection
 	listener.OnError = func(err error) {
 		if s.OnError != nil {
 			s.OnError(err)
 		} else {
-			s.logf("Listener error: %v", err)
+			s.logger().Warnw("bfcp.listener.error", err)
 		}
 	}
 
@@ -142,7 +141,7 @@ func (s *Server) ListenAndServe() error {
 }
 
 func (s *Server) Close() error {
-	s.logf("Closing BFCP server")
+	s.logger().Debugw("bfcp.server.closing")
 
 	s.mu.RLock()
 	sessions := make([]*Session, 0, len(s.sessions))
@@ -171,7 +170,7 @@ func (s *Server) Addr() net.Addr {
 
 func (s *Server) handleConnection(transport *Transport) {
 	remoteAddr := transport.RemoteAddr().String()
-	s.logf("New TCP connection from %s", remoteAddr)
+	s.logger().Debugw("bfcp.conn.accepted", "remote", remoteAddr)
 
 	session := &Session{
 		Transport:    transport,
@@ -184,11 +183,11 @@ func (s *Server) handleConnection(transport *Transport) {
 	}
 
 	transport.OnError = func(err error) {
-		s.logf("Transport error for %s: %v", remoteAddr, err)
+		s.logger().Warnw("bfcp.transport.error", err, "remote", remoteAddr)
 	}
 
 	transport.OnClose = func() {
-		s.logf("Connection closed: %s", remoteAddr)
+		s.logger().Debugw("bfcp.conn.closed", "remote", remoteAddr)
 
 		s.mu.Lock()
 		delete(s.sessions, remoteAddr)
@@ -204,9 +203,11 @@ func (s *Server) handleConnection(transport *Transport) {
 
 func (sess *Session) handleMessage(msg *Message) {
 	sess.StateMachine.UpdateActivity()
-	sess.Server.logf("Received %s from %s (TxID: %d)", msg.Primitive, sess.Transport.RemoteAddr(), msg.TransactionID)
+	sess.Server.logger().Debugw("bfcp.msg.recv",
+		"primitive", msg.Primitive.String(),
+		"remote", sess.Transport.RemoteAddr().String(),
+		"txID", msg.TransactionID)
 
-	// Call OnMessageIn callback for structured logging
 	if sess.Server.OnMessageIn != nil {
 		floorID, _ := msg.GetFloorID()
 		sess.Server.OnMessageIn(
@@ -236,13 +237,13 @@ func (sess *Session) handleMessage(msg *Message) {
 		PrimitiveFloorStatusAck,
 		PrimitiveHelloAck,
 		PrimitiveGoodbyeAck:
-		sess.Server.logf("Received client acknowledgment - ignoring")
+		sess.Server.logger().Debugw("bfcp.msg.ack_ignored", "primitive", msg.Primitive.String())
 	case PrimitiveError:
 		if errorCode, ok := msg.GetErrorCode(); ok {
 			errorInfo, _ := msg.GetErrorInfo()
-			sess.Server.logf("Received error from client - ErrorCode=%s(%d), ErrorInfo=%q", errorCode, errorCode, errorInfo)
+			sess.Server.logger().Warnw("bfcp.error.from_client", nil, "errorCode", errorCode.String(), "errorInfo", errorInfo)
 		} else {
-			sess.Server.logf("Received error from client (no error code)")
+			sess.Server.logger().Warnw("bfcp.error.from_client", nil, "errorCode", "unknown")
 		}
 	default:
 		sess.sendError(msg, ErrorUnknownPrimitive, fmt.Sprintf("Unknown primitive: %d", msg.Primitive))
@@ -250,7 +251,7 @@ func (sess *Session) handleMessage(msg *Message) {
 }
 
 func (sess *Session) handleHello(msg *Message) {
-	sess.Server.logf("Processing Hello from user %d (confID=%d)", msg.UserID, msg.ConferenceID)
+	sess.Server.logger().Debugw("bfcp.hello.processing", "userID", msg.UserID, "confID", msg.ConferenceID)
 
 	sess.StateMachine.ConferenceID = msg.ConferenceID
 	sess.StateMachine.UserID = msg.UserID
@@ -328,18 +329,18 @@ func (sess *Session) handleHello(msg *Message) {
 }
 
 func (sess *Session) handleFloorRequest(msg *Message) {
-	sess.Server.logf("Processing FloorRequest from user %d", msg.UserID)
+	sess.Server.logger().Debugw("bfcp.floor_request.processing", "userID", msg.UserID)
 
 	floorID, ok := msg.GetFloorID()
 	if !ok {
-		sess.Server.logf("No floor ID in request")
+		sess.Server.logger().Warnw("bfcp.floor_request.no_floor_id", nil)
 		sess.sendError(msg, ErrorInvalidFloorID, "No floor ID in request")
 		return
 	}
 
 	floor, exists := sess.Server.GetFloor(floorID)
 	if !exists {
-		sess.Server.logf("Floor %d does not exist, creating it", floorID)
+		sess.Server.logger().Debugw("bfcp.floor.auto_create", "floorID", floorID)
 		floor = sess.Server.CreateFloor(floorID)
 	}
 
@@ -362,7 +363,7 @@ func (sess *Session) handleFloorRequest(msg *Message) {
 
 	status, err := floor.Request(msg.UserID, requestID, priority)
 	if err != nil {
-		sess.Server.logf("Floor request failed: %v", err)
+		sess.Server.logger().Warnw("bfcp.floor_request.failed", err, "userID", msg.UserID, "floorID", floorID)
 		sess.sendError(msg, ErrorUnauthorizedOperation, err.Error())
 		if sess.Server.OnFloorDenied != nil {
 			sess.Server.OnFloorDenied(floorID, msg.UserID, requestID)
@@ -398,7 +399,7 @@ func (sess *Session) handleFloorRequest(msg *Message) {
 }
 
 func (sess *Session) handleFloorRelease(msg *Message) {
-	sess.Server.logf("Processing FloorRelease from user %d", msg.UserID)
+	sess.Server.logger().Debugw("bfcp.floor_release.processing", "userID", msg.UserID)
 
 	floorID, ok := msg.GetFloorID()
 	if !ok {
@@ -415,7 +416,7 @@ func (sess *Session) handleFloorRelease(msg *Message) {
 	requestID, _ := msg.GetFloorRequestID()
 
 	if err := floor.Release(msg.UserID); err != nil {
-		sess.Server.logf("Release denied: %v", err)
+		sess.Server.logger().Warnw("bfcp.floor_release.denied", err, "userID", msg.UserID, "floorID", floorID)
 		sess.sendError(msg, ErrorFloorReleaseDenied, err.Error())
 		return
 	}
@@ -452,7 +453,7 @@ func (sess *Session) handleFloorQuery(msg *Message) {
 }
 
 func (sess *Session) handleGoodbye(msg *Message) {
-	sess.Server.logf("Processing Goodbye from user %d", msg.UserID)
+	sess.Server.logger().Debugw("bfcp.goodbye.processing", "userID", msg.UserID)
 
 	sess.Server.mu.RLock()
 	floors := make([]*FloorStateMachine, 0)
@@ -495,16 +496,20 @@ func (sess *Session) sendError(req *Message, errorCode ErrorCode, errorInfo stri
 		response.AddErrorInfo(errorInfo)
 	}
 	sess.send(response)
-	sess.Server.logf("Sent error to %s: %s - %s", sess.Transport.RemoteAddr(), errorCode, errorInfo)
+	sess.Server.logger().Warnw("bfcp.error.sent", nil, "remote", sess.Transport.RemoteAddr().String(), "errorCode", errorCode.String(), "errorInfo", errorInfo)
 }
 
 func (sess *Session) send(msg *Message) {
 	if err := sess.Transport.SendMessage(msg); err != nil {
-		sess.Server.logf("Failed to send %s to %s: %v", msg.Primitive, sess.Transport.RemoteAddr(), err)
+		sess.Server.logger().Errorw("bfcp.msg.send_failed", err,
+			"primitive", msg.Primitive.String(),
+			"remote", sess.Transport.RemoteAddr().String())
 	} else {
-		sess.Server.logf("Sent %s to %s (TxID: %d)", msg.Primitive, sess.Transport.RemoteAddr(), msg.TransactionID)
+		sess.Server.logger().Debugw("bfcp.msg.sent",
+			"primitive", msg.Primitive.String(),
+			"remote", sess.Transport.RemoteAddr().String(),
+			"txID", msg.TransactionID)
 
-		// Call OnMessageOut callback for structured logging
 		if sess.Server.OnMessageOut != nil {
 			floorID, _ := msg.GetFloorID()
 			sess.Server.OnMessageOut(
@@ -521,7 +526,7 @@ func (sess *Session) send(msg *Message) {
 
 func (sess *Session) sendRaw(data []byte) {
 	if err := sess.Transport.SendRawData(data); err != nil {
-		sess.Server.logf("Failed to send raw data to %s: %v", sess.Transport.RemoteAddr(), err)
+		sess.Server.logger().Errorw("bfcp.msg.send_raw_failed", err, "remote", sess.Transport.RemoteAddr().String())
 	}
 }
 
@@ -602,15 +607,18 @@ func (s *Server) broadcastFloorState(floorID uint16, beneficiaryID uint16, statu
 			status,
 		)
 
-		s.logf("FloorStatus to userID=%d: floorID=%d, status=%s, hex(%d bytes): %X",
-			session.StateMachine.UserID, floorID, status, len(encoded), encoded)
+		s.logger().Debugw("bfcp.floor_status.broadcast",
+			"userID", session.StateMachine.UserID,
+			"floorID", floorID,
+			"status", status.String())
 
 		session.sendRaw(encoded)
 	}
 }
 
-func (s *Server) logf(format string, args ...interface{}) {
-	if s.config.EnableLogging {
-		log.Printf("[BFCP Server] "+format, args...)
+func (s *Server) logger() Logger {
+	if s.config.Logger != nil {
+		return s.config.Logger
 	}
+	return NopLogger{}
 }

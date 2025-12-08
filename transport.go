@@ -3,7 +3,6 @@ package bfcp
 import (
 	"context"
 	"fmt"
-	"log"
 	"net"
 	"strings"
 	"sync"
@@ -38,20 +37,30 @@ type Transport struct {
 	role   ConnectionRole
 	mu     sync.RWMutex
 	closed bool
+	logger Logger
 
-	// Message handlers
 	OnMessage func(*Message)
 	OnError   func(error)
 	OnClose   func()
 
-	// Context for cancellation
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	// Keepalive settings
 	keepaliveInterval time.Duration
-	keepaliveSender   func() error // Function to send keepalive message
+	keepaliveSender   func() error
 	keepaliveWg       sync.WaitGroup
+}
+
+func (t *Transport) log() Logger {
+	if t.logger != nil {
+		return t.logger
+	}
+	return NopLogger{}
+}
+
+// SetLogger sets the logger for this transport
+func (t *Transport) SetLogger(l Logger) {
+	t.logger = l
 }
 
 // NewTransport creates a new BFCP transport from an existing connection
@@ -67,18 +76,31 @@ func NewTransport(conn net.Conn, role ConnectionRole) *Transport {
 
 // Dial creates an active BFCP connection to the specified address
 func Dial(address string) (*Transport, error) {
-	log.Printf("🔌 [BFCP Transport] Dialing TCP connection to %s (timeout: 10s)", address)
 	conn, err := net.DialTimeout("tcp", address, 10*time.Second)
 	if err != nil {
-		log.Printf("❌ [BFCP Transport] TCP dial failed to %s: %v", address, err)
 		return nil, fmt.Errorf("failed to dial %s: %w", address, err)
 	}
-
-	log.Printf("✅ [BFCP Transport] TCP connection established to %s", address)
-	log.Printf("   ➜ Local address: %s", conn.LocalAddr())
-	log.Printf("   ➜ Remote address: %s", conn.RemoteAddr())
-
 	return NewTransport(conn, RoleActive), nil
+}
+
+// DialWithLogger creates an active BFCP connection with logging
+func DialWithLogger(address string, logger Logger) (*Transport, error) {
+	if logger != nil {
+		logger.Debugw("bfcp.tcp.dialing", "addr", address)
+	}
+	conn, err := net.DialTimeout("tcp", address, 10*time.Second)
+	if err != nil {
+		if logger != nil {
+			logger.Errorw("bfcp.tcp.dial_failed", err, "addr", address)
+		}
+		return nil, fmt.Errorf("failed to dial %s: %w", address, err)
+	}
+	if logger != nil {
+		logger.Debugw("bfcp.tcp.connected", "local", conn.LocalAddr().String(), "remote", conn.RemoteAddr().String())
+	}
+	t := NewTransport(conn, RoleActive)
+	t.logger = logger
+	return t, nil
 }
 
 // DialContext creates an active BFCP connection with context
@@ -103,8 +125,7 @@ func (t *Transport) EnableKeepalive(interval time.Duration, sender func() error)
 	t.keepaliveSender = sender
 }
 
-// StartKeepalive starts the keepalive goroutine if configured
-// This should be called after EnableKeepalive() to actually start sending keepalives
+// StartKeepalive starts the keepalive goroutine if configured.
 func (t *Transport) StartKeepalive() {
 	t.mu.RLock()
 	interval := t.keepaliveInterval
@@ -112,7 +133,7 @@ func (t *Transport) StartKeepalive() {
 	t.mu.RUnlock()
 
 	if interval > 0 && sender != nil {
-		log.Printf("💓 [BFCP Transport] Starting keepalive (interval: %v)", interval)
+		t.log().Debugw("bfcp.keepalive.start", "interval", interval.String())
 		t.keepaliveWg.Add(1)
 		go t.keepaliveLoop()
 	}
@@ -120,50 +141,44 @@ func (t *Transport) StartKeepalive() {
 
 // Start begins reading messages from the connection
 func (t *Transport) Start() {
-	log.Printf("📖 [BFCP Transport] Starting read loop (role: %s)", t.role)
+	t.log().Debugw("bfcp.read.starting", "role", t.role.String())
 	go t.readLoop()
 
-	// Start keepalive if configured
 	if t.keepaliveInterval > 0 && t.keepaliveSender != nil {
-		log.Printf("💓 [BFCP Transport] Starting keepalive (interval: %v)", t.keepaliveInterval)
+		t.log().Debugw("bfcp.keepalive.start", "interval", t.keepaliveInterval.String())
 		t.keepaliveWg.Add(1)
 		go t.keepaliveLoop()
 	}
 }
 
-// keepaliveLoop sends periodic keepalive messages
 func (t *Transport) keepaliveLoop() {
 	defer t.keepaliveWg.Done()
 	ticker := time.NewTicker(t.keepaliveInterval)
 	defer ticker.Stop()
 
-	log.Printf("💓 [BFCP Transport] Keepalive loop started (interval: %v)", t.keepaliveInterval)
+	t.log().Debugw("bfcp.keepalive.running", "interval", t.keepaliveInterval.String())
 
 	for {
 		select {
 		case <-t.ctx.Done():
-			log.Printf("⏹️ [BFCP Transport] Keepalive loop stopping (context cancelled)")
+			t.log().Debugw("bfcp.keepalive.stopping", "reason", "context_cancelled")
 			return
 		case <-ticker.C:
 			if t.IsClosed() {
-				log.Printf("⏹️ [BFCP Transport] Keepalive loop stopping (transport closed)")
+				t.log().Debugw("bfcp.keepalive.stopping", "reason", "transport_closed")
 				return
 			}
-
-			// Call keepalive sender without the extra log (sender will handle logging)
 			if err := t.keepaliveSender(); err != nil {
-				log.Printf("⚠️ [BFCP Transport] Keepalive send failed: %v", err)
-				// Don't stop on keepalive failure - connection might still be alive
+				t.log().Warnw("bfcp.keepalive.failed", err)
 			}
 		}
 	}
 }
 
-// readLoop continuously reads messages from the connection
 func (t *Transport) readLoop() {
-	log.Printf("🔄 [BFCP Transport] Read loop started")
+	t.log().Debugw("bfcp.read.started", "role", t.role.String())
 	defer func() {
-		log.Printf("🛑 [BFCP Transport] Read loop exiting, closing connection")
+		t.log().Debugw("bfcp.read.exiting")
 		t.Close()
 		if t.OnClose != nil {
 			t.OnClose()
@@ -173,14 +188,14 @@ func (t *Transport) readLoop() {
 	for {
 		select {
 		case <-t.ctx.Done():
-			log.Printf("⏹️ [BFCP Transport] Context cancelled, stopping read loop")
+			t.log().Debugw("bfcp.read.stopping", "reason", "context_cancelled")
 			return
 		default:
 		}
 
 		// Set read deadline to allow periodic context checks
 		if err := t.conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-			log.Printf("❌ [BFCP Transport] Failed to set read deadline: %v", err)
+			t.log().Errorw("bfcp.read.deadline_failed", err)
 			if t.OnError != nil {
 				t.OnError(fmt.Errorf("failed to set read deadline: %w", err))
 			}
@@ -199,32 +214,25 @@ func (t *Transport) readLoop() {
 			}
 
 			if isTimeout {
-				// Timeout is expected when using keepalives
-				// Just continue reading, keepalive will maintain connection health
 				continue
 			}
 
-			// Check if this is EOF or connection closed (graceful shutdown scenarios)
 			isEOF := strings.Contains(err.Error(), "EOF")
 			isConnClosed := strings.Contains(err.Error(), "use of closed network connection")
 
 			if isEOF || isConnClosed {
-				// EOF or closed connection - check if it's expected
 				select {
 				case <-t.ctx.Done():
-					// Context cancelled - this is intentional close
-					log.Printf("⏹️ [BFCP Transport] Connection closed during graceful shutdown")
+					t.log().Debugw("bfcp.read.closed", "reason", "graceful_shutdown")
 					return
 				default:
-					// Remote peer closed connection - this is normal, not an error
-					log.Printf("⏹️ [BFCP Transport] Connection closed by remote peer")
+					t.log().Debugw("bfcp.read.closed", "reason", "remote_peer")
 					return
 				}
 			}
 
-			// Real error - log and close connection
 			if !t.IsClosed() {
-				log.Printf("❌ [BFCP Transport] Read error: %v", err)
+				t.log().Warnw("bfcp.read.error", err)
 				if t.OnError != nil {
 					t.OnError(fmt.Errorf("failed to read message: %w", err))
 				}
@@ -232,8 +240,10 @@ func (t *Transport) readLoop() {
 			return
 		}
 
-		log.Printf("📨 [BFCP Transport] Message received: Primitive=%s, TxID=%d, Length=%d bytes",
-			msg.Primitive, msg.TransactionID, len(msg.Attributes))
+		t.log().Debugw("bfcp.msg.received",
+			"primitive", msg.Primitive.String(),
+			"txID", msg.TransactionID,
+			"attrCount", len(msg.Attributes))
 
 		if t.OnMessage != nil {
 			t.OnMessage(msg)
@@ -257,62 +267,55 @@ func (t *Transport) SendRawData(data []byte) error {
 	defer t.mu.RUnlock()
 
 	if t.closed {
-		log.Printf("❌ [BFCP Transport] Cannot send - transport is closed")
 		return fmt.Errorf("transport is closed")
 	}
 
-	// Set write deadline
 	if err := t.conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		log.Printf("❌ [BFCP Transport] Failed to set write deadline: %v", err)
+		t.log().Errorw("bfcp.write.deadline_failed", err)
 		return fmt.Errorf("failed to set write deadline: %w", err)
 	}
 
 	if _, err := t.conn.Write(data); err != nil {
-		log.Printf("❌ [BFCP Transport] Failed to write raw data: %v", err)
+		t.log().Errorw("bfcp.write.failed", err, "bytes", len(data))
 		return fmt.Errorf("failed to write raw data: %w", err)
 	}
 
-	log.Printf("📤 [BFCP Transport] Sent raw data (%d bytes): %X", len(data), data)
+	t.log().Debugw("bfcp.msg.sent_raw", "bytes", len(data))
 	return nil
 }
 
-// sendMessage sends a BFCP message over the transport with optional verbose flag
 func (t *Transport) sendMessage(msg *Message, isKeepalive bool) error {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
 	if t.closed {
-		log.Printf("❌ [BFCP Transport] Cannot send - transport is closed")
 		return fmt.Errorf("transport is closed")
 	}
 
-	// Encode message
 	data, err := msg.Encode()
 	if err != nil {
-		log.Printf("❌ [BFCP Transport] Failed to encode message: %v", err)
+		t.log().Errorw("bfcp.encode.failed", err)
 		return fmt.Errorf("failed to encode message: %w", err)
 	}
 
-	// Set write deadline
 	if err := t.conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		log.Printf("❌ [BFCP Transport] Failed to set write deadline: %v", err)
+		t.log().Errorw("bfcp.write.deadline_failed", err)
 		return fmt.Errorf("failed to set write deadline: %w", err)
 	}
 
 	if _, err := t.conn.Write(data); err != nil {
-		log.Printf("❌ [BFCP Transport] Failed to write message: %v", err)
+		t.log().Errorw("bfcp.write.failed", err)
 		return fmt.Errorf("failed to write message: %w", err)
 	}
 
-	// For keepalive messages, log a single concise line
 	if isKeepalive {
-		log.Printf("💓 [BFCP] Keepalive sent to user %d (TxID=%d, %d bytes)", msg.UserID, msg.TransactionID, len(data))
+		t.log().Debugw("bfcp.keepalive.sent", "userID", msg.UserID, "txID", msg.TransactionID)
 	} else {
-		// For non-keepalive messages, log verbose details
-		log.Printf("📤 [BFCP Transport] Sending message: Primitive=%s, TxID=%d, ConferenceID=%d, UserID=%d",
-			msg.Primitive, msg.TransactionID, msg.ConferenceID, msg.UserID)
-		log.Printf("🔍 [BFCP Transport] Message hex dump (%d bytes): %X", len(data), data)
-		log.Printf("✅ [BFCP Transport] Message sent successfully")
+		t.log().Debugw("bfcp.msg.sending",
+			"primitive", msg.Primitive.String(),
+			"txID", msg.TransactionID,
+			"confID", msg.ConferenceID,
+			"userID", msg.UserID)
 	}
 
 	return nil
@@ -373,14 +376,25 @@ type Listener struct {
 	listener net.Listener
 	mu       sync.RWMutex
 	closed   bool
+	logger   Logger
 
-	// Connection handler
 	OnConnection func(*Transport)
 	OnError      func(error)
 
-	// Context for cancellation
 	ctx    context.Context
 	cancel context.CancelFunc
+}
+
+// SetLogger sets the logger for this listener
+func (l *Listener) SetLogger(log Logger) {
+	l.logger = log
+}
+
+func (l *Listener) log() Logger {
+	if l.logger != nil {
+		return l.logger
+	}
+	return NopLogger{}
 }
 
 // Listen creates a new BFCP listener on the specified address
@@ -433,7 +447,6 @@ func (l *Listener) acceptLoop() {
 		conn, err := l.listener.Accept()
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				// Timeout is expected, continue
 				continue
 			}
 			if !l.IsClosed() && l.OnError != nil {
@@ -442,7 +455,6 @@ func (l *Listener) acceptLoop() {
 			return
 		}
 
-		// Create transport for this connection
 		transport := NewTransport(conn, RolePassive)
 
 		if l.OnConnection != nil {

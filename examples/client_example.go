@@ -20,9 +20,6 @@ func main() {
 	userID := uint16(100)
 
 	config := bfcp.DefaultClientConfig(serverAddr, conferenceID, userID)
-	config.EnableLogging = true
-
-	// Create the client
 	client := bfcp.NewClient(config)
 
 	// Set up event callbacks

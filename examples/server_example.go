@@ -10,11 +10,9 @@ import (
 )
 
 func main() {
-	// Create server configuration
 	config := bfcp.DefaultServerConfig(":5070", 1)
 	config.AutoGrant = true
 	config.MaxFloors = 5
-	config.EnableLogging = true
 
 	// Create the server
 	server := bfcp.NewServer(config)
