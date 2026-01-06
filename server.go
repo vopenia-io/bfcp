@@ -3,6 +3,7 @@ package bfcp
 import (
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -10,6 +11,8 @@ import (
 
 type ServerConfig struct {
 	Address        string
+	PortMin        int // Port range start (used when Address ends with :0)
+	PortMax        int // Port range end
 	ConferenceID   uint32
 	AutoGrant      bool
 	MaxFloors      int
@@ -104,7 +107,18 @@ func (s *Server) ReleaseFloor(floorID uint16) {
 // After this returns successfully, Addr() will return the bound address.
 // Call Serve() to start accepting connections.
 func (s *Server) Listen() error {
-	listener, err := Listen(s.config.Address)
+	var listener *Listener
+	var err error
+
+	// Check if Address ends with :0 and port range is configured
+	if strings.HasSuffix(s.config.Address, ":0") && s.config.PortMin > 0 && s.config.PortMax > 0 {
+		// Extract IP (remove :0 suffix)
+		ip := strings.TrimSuffix(s.config.Address, ":0")
+		listener, err = ListenPortRange(ip, s.config.PortMin, s.config.PortMax)
+	} else {
+		listener, err = Listen(s.config.Address)
+	}
+
 	if err != nil {
 		return fmt.Errorf("failed to create listener: %w", err)
 	}

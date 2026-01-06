@@ -498,3 +498,22 @@ func (l *Listener) Addr() net.Addr {
 	}
 	return l.listener.Addr()
 }
+
+// ListenPortRange creates a new BFCP listener on the first available port in the given range.
+func ListenPortRange(ip string, portMin, portMax int) (*Listener, error) {
+	var lastErr error
+	for port := portMin; port < portMax; port++ {
+		address := fmt.Sprintf("%s:%d", ip, port)
+		listener, err := net.Listen("tcp", address)
+		if err == nil {
+			ctx, cancel := context.WithCancel(context.Background())
+			return &Listener{
+				listener: listener,
+				ctx:      ctx,
+				cancel:   cancel,
+			}, nil
+		}
+		lastErr = err
+	}
+	return nil, fmt.Errorf("no available TCP port in range %d-%d: %w", portMin, portMax, lastErr)
+}
