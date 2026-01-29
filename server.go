@@ -66,10 +66,20 @@ type Server struct {
 }
 
 type Session struct {
-	Transport    *Transport    // TCP transport (nil for UDP sessions)
-	UDPTransport *UDPTransport // UDP transport (nil for TCP sessions)
+	Transport    *Transport
+	UDPTransport *UDPTransport
 	StateMachine *SessionStateMachine
 	Server       *Server
+}
+
+func (sess *Session) ProtocolVersion() uint8 {
+	if sess.StateMachine != nil && sess.StateMachine.ClientVersion > 0 {
+		return sess.StateMachine.ClientVersion
+	}
+	if sess.UDPTransport != nil {
+		return ProtocolVersionRFC8855
+	}
+	return ProtocolVersionRFC4582
 }
 
 func NewServer(config *ServerConfig) *Server {
@@ -278,15 +288,9 @@ func (s *Server) handleConnection(transport *Transport) {
 	transport.Start()
 }
 
-// handleUDPMessage handles incoming BFCP messages over UDP
 func (s *Server) handleUDPMessage(transport *UDPTransport, msg *Message) {
 	remoteAddr := transport.RemoteAddr().String()
-	s.logger().Debugw("bfcp.udp.msg.recv",
-		"primitive", msg.Primitive.String(),
-		"remote", remoteAddr,
-		"txID", msg.TransactionID)
 
-	// Get or create session for this remote address
 	s.mu.Lock()
 	session, exists := s.sessions[remoteAddr]
 	if !exists {
@@ -295,7 +299,6 @@ func (s *Server) handleUDPMessage(transport *UDPTransport, msg *Message) {
 			StateMachine: NewSessionStateMachine(uint16(s.config.ConferenceID), 0, remoteAddr),
 			Server:       s,
 		}
-		// Don't add to sessions map yet - wait for Hello
 	}
 	s.mu.Unlock()
 
@@ -308,11 +311,6 @@ func (sess *Session) handleUDPMessage(msg *Message) {
 	if sess.UDPTransport != nil {
 		remoteAddr = sess.UDPTransport.RemoteAddr().String()
 	}
-
-	sess.Server.logger().Debugw("bfcp.udp.msg.processing",
-		"primitive", msg.Primitive.String(),
-		"remote", remoteAddr,
-		"txID", msg.TransactionID)
 
 	if sess.Server.OnMessageIn != nil {
 		floorID, _ := msg.GetFloorID()
@@ -357,10 +355,11 @@ func (sess *Session) handleUDPMessage(msg *Message) {
 }
 
 func (sess *Session) handleUDPHello(msg *Message) {
-	sess.Server.logger().Debugw("bfcp.udp.hello.processing", "userID", msg.UserID, "confID", msg.ConferenceID)
+	sess.Server.logger().Debugw("bfcp.udp.hello.processing", "userID", msg.UserID, "confID", msg.ConferenceID, "clientVersion", msg.Version)
 
 	sess.StateMachine.ConferenceID = msg.ConferenceID
 	sess.StateMachine.UserID = msg.UserID
+	sess.StateMachine.ClientVersion = msg.Version // Store client's BFCP version for echoing back
 
 	remoteAddr := sess.UDPTransport.RemoteAddr().String()
 	sess.Server.mu.Lock()
@@ -553,8 +552,6 @@ func (sess *Session) handleUDPFloorQuery(msg *Message) {
 }
 
 func (sess *Session) handleUDPGoodbye(msg *Message) {
-	sess.Server.logger().Debugw("bfcp.udp.goodbye.processing", "userID", msg.UserID)
-
 	sess.Server.mu.RLock()
 	floors := make([]*FloorStateMachine, 0)
 	for _, floor := range sess.Server.floors {
@@ -719,10 +716,11 @@ func (sess *Session) handleMessage(msg *Message) {
 }
 
 func (sess *Session) handleHello(msg *Message) {
-	sess.Server.logger().Debugw("bfcp.hello.processing", "userID", msg.UserID, "confID", msg.ConferenceID)
+	sess.Server.logger().Debugw("bfcp.hello.processing", "userID", msg.UserID, "confID", msg.ConferenceID, "clientVersion", msg.Version)
 
 	sess.StateMachine.ConferenceID = msg.ConferenceID
 	sess.StateMachine.UserID = msg.UserID
+	sess.StateMachine.ClientVersion = msg.Version // Store client's BFCP version for echoing back
 
 	remoteAddr := sess.Transport.RemoteAddr().String()
 	sess.Server.mu.Lock()
@@ -968,6 +966,15 @@ func (sess *Session) sendError(req *Message, errorCode ErrorCode, errorInfo stri
 }
 
 func (sess *Session) send(msg *Message) {
+	// Handle both TCP and UDP transports
+	if sess.UDPTransport != nil {
+		sess.sendUDP(msg)
+		return
+	}
+	if sess.Transport == nil {
+		sess.Server.logger().Errorw("bfcp.msg.send_failed", nil, "error", "no transport available")
+		return
+	}
 	if err := sess.Transport.SendMessage(msg); err != nil {
 		sess.Server.logger().Errorw("bfcp.msg.send_failed", err,
 			"primitive", msg.Primitive.String(),
@@ -993,9 +1000,19 @@ func (sess *Session) send(msg *Message) {
 }
 
 func (sess *Session) sendRaw(data []byte) {
-	if err := sess.Transport.SendRawData(data); err != nil {
-		sess.Server.logger().Errorw("bfcp.msg.send_raw_failed", err, "remote", sess.Transport.RemoteAddr().String())
+	if sess.UDPTransport != nil {
+		if err := sess.UDPTransport.SendRawData(data); err != nil {
+			sess.Server.logger().Errorw("bfcp.msg.send_raw_failed", err, "remote", sess.UDPTransport.RemoteAddr().String())
+		}
+		return
 	}
+	if sess.Transport != nil {
+		if err := sess.Transport.SendRawData(data); err != nil {
+			sess.Server.logger().Errorw("bfcp.msg.send_raw_failed", err, "remote", sess.Transport.RemoteAddr().String())
+		}
+		return
+	}
+	sess.Server.logger().Errorw("bfcp.msg.send_raw_failed", nil, "error", "no transport available")
 }
 
 func (s *Server) GrantFloor(floorID, userID uint16) error {
@@ -1055,18 +1072,13 @@ func (s *Server) broadcastFloorState(floorID uint16, beneficiaryID uint16, statu
 
 	for _, session := range sessions {
 		txID := uint16(s.nextTxID.Add(1))
-
-		// Use BuildFloorStatusMessage for proper RFC 4582 encoding with:
-		// - Length in 32-bit words
-		// - Correct nested attribute structure:
-		//   FLOOR-ID (top-level)
-		//   FLOOR-REQUEST-INFORMATION:
-		//     FLOOR-REQUEST-ID
-		//     FLOOR-REQUEST-STATUS:
-		//       FLOOR-ID
-		//       REQUEST-STATUS
 		requestID := uint16(1) // Synthetic request ID for virtual client notification
+		clientVersion := session.ProtocolVersion()
+
+		// Use FloorStatus (primitive 8) for all sessions - both TCP and UDP
+		// This is the standard BFCP notification primitive that both Cisco and Poly understand
 		encoded := BuildFloorStatusMessage(
+			clientVersion,
 			s.config.ConferenceID,
 			txID,
 			session.StateMachine.UserID,
@@ -1074,11 +1086,6 @@ func (s *Server) broadcastFloorState(floorID uint16, beneficiaryID uint16, statu
 			requestID,
 			status,
 		)
-
-		s.logger().Debugw("bfcp.floor_status.broadcast",
-			"userID", session.StateMachine.UserID,
-			"floorID", floorID,
-			"status", status.String())
 
 		session.sendRaw(encoded)
 	}

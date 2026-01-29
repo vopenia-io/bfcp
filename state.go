@@ -157,14 +157,15 @@ func (fsm *FloorStateMachine) IsGranted() bool {
 type SessionStateMachine struct {
 	mu sync.RWMutex
 
-	CurrentState       SessionState
-	ConferenceID       uint32
-	UserID             uint16
-	RemoteAddr         string
+	CurrentState        SessionState
+	ConferenceID        uint32
+	UserID              uint16
+	RemoteAddr          string
+	ClientVersion       uint8 // BFCP version from client's Hello message (for echoing back)
 	SupportedPrimitives []Primitive
 	SupportedAttributes []AttributeType
-	CreatedAt          time.Time
-	LastActivityAt     time.Time
+	CreatedAt           time.Time
+	LastActivityAt      time.Time
 }
 
 // NewSessionStateMachine creates a new session state machine

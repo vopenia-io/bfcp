@@ -232,7 +232,7 @@ func buildGroupedAttrWithHeaderID(attrType uint8, mandatory bool, headerID uint1
 // Key difference from old code: FLOOR-REQUEST-INFORMATION, FLOOR-REQUEST-STATUS, and
 // OVERALL-REQUEST-STATUS have 2-byte header IDs directly in their TLV structure,
 // BEFORE any sub-attributes.
-func BuildFloorStatusMessage(confID uint32, txID uint16, userID uint16, floorID uint16, requestID uint16, status RequestStatus) []byte {
+func BuildFloorStatusMessage(version uint8, confID uint32, txID uint16, userID uint16, floorID uint16, requestID uint16, status RequestStatus) []byte {
 	// 1) FLOOR-ID (top-level, mandatory, simple attribute)
 	floorIDVal := make([]byte, 2)
 	binary.BigEndian.PutUint16(floorIDVal, floorID)
@@ -276,8 +276,9 @@ func BuildFloorStatusMessage(confID uint32, txID uint16, userID uint16, floorID 
 	lengthWords := uint16(len(payload) / 4)
 	buf := make([]byte, 12+len(payload))
 
-	// Byte 0: Version(3 bits) + Reserved(5 bits) - Version 1 = 0x20
-	buf[0] = 0x20 // Version 1
+	// Byte 0: Version(3 bits) + Reserved(5 bits)
+	// Version 1 (RFC 4582/TCP) = 0x20, Version 2 (RFC 8855/UDP) = 0x40
+	buf[0] = version << 5
 
 	// Byte 1: Primitive (FloorStatus = 8)
 	buf[1] = uint8(PrimitiveFloorStatus)

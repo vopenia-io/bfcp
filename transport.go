@@ -765,13 +765,7 @@ func (l *UDPListener) readLoop() {
 			continue
 		}
 
-		// Get or create transport for this remote address
 		transport := l.getOrCreateTransport(remoteAddr)
-
-		l.log().Debugw("bfcp.udp.msg.received",
-			"primitive", msg.Primitive.String(),
-			"txID", msg.TransactionID,
-			"remote", remoteAddr.String())
 
 		if l.OnMessage != nil {
 			l.OnMessage(transport, msg)
