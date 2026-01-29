@@ -517,3 +517,339 @@ func ListenPortRange(ip string, portMin, portMax int) (*Listener, error) {
 	}
 	return nil, fmt.Errorf("no available TCP port in range %d-%d: %w", portMin, portMax, lastErr)
 }
+
+// UDPTransport represents a BFCP UDP transport (RFC 8855)
+// Unlike TCP, UDP is connectionless so we track remote addresses per-session
+type UDPTransport struct {
+	conn       *net.UDPConn
+	remoteAddr *net.UDPAddr
+	mu         sync.RWMutex
+	closed     bool
+	logger     Logger
+
+	OnMessage func(*Message)
+	OnError   func(error)
+	OnClose   func()
+
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+// NewUDPTransport creates a new BFCP UDP transport from an existing connection
+func NewUDPTransport(conn *net.UDPConn, remoteAddr *net.UDPAddr) *UDPTransport {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &UDPTransport{
+		conn:       conn,
+		remoteAddr: remoteAddr,
+		ctx:        ctx,
+		cancel:     cancel,
+	}
+}
+
+func (t *UDPTransport) log() Logger {
+	if t.logger != nil {
+		return t.logger
+	}
+	return NopLogger{}
+}
+
+// SetLogger sets the logger for this transport
+func (t *UDPTransport) SetLogger(l Logger) {
+	t.logger = l
+}
+
+// SetRemoteAddr updates the remote address for sending messages
+func (t *UDPTransport) SetRemoteAddr(addr *net.UDPAddr) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.remoteAddr = addr
+}
+
+// SendMessage sends a BFCP message over UDP to the remote address
+func (t *UDPTransport) SendMessage(msg *Message) error {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	if t.closed {
+		return fmt.Errorf("transport is closed")
+	}
+
+	if t.remoteAddr == nil {
+		return fmt.Errorf("no remote address set")
+	}
+
+	data, err := msg.Encode()
+	if err != nil {
+		t.log().Errorw("bfcp.udp.encode_failed", err)
+		return fmt.Errorf("failed to encode message: %w", err)
+	}
+
+	if _, err := t.conn.WriteToUDP(data, t.remoteAddr); err != nil {
+		t.log().Errorw("bfcp.udp.write_failed", err, "remote", t.remoteAddr.String())
+		return fmt.Errorf("failed to write message: %w", err)
+	}
+
+	t.log().Debugw("bfcp.udp.msg.sent",
+		"primitive", msg.Primitive.String(),
+		"txID", msg.TransactionID,
+		"remote", t.remoteAddr.String())
+
+	return nil
+}
+
+// SendRawData sends pre-encoded raw bytes over UDP
+func (t *UDPTransport) SendRawData(data []byte) error {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	if t.closed {
+		return fmt.Errorf("transport is closed")
+	}
+
+	if t.remoteAddr == nil {
+		return fmt.Errorf("no remote address set")
+	}
+
+	if _, err := t.conn.WriteToUDP(data, t.remoteAddr); err != nil {
+		t.log().Errorw("bfcp.udp.write_raw_failed", err, "remote", t.remoteAddr.String())
+		return fmt.Errorf("failed to write raw data: %w", err)
+	}
+
+	t.log().Debugw("bfcp.udp.msg.sent_raw", "bytes", len(data), "remote", t.remoteAddr.String())
+	return nil
+}
+
+// Close closes the UDP transport
+func (t *UDPTransport) Close() error {
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return nil
+	}
+	t.closed = true
+	t.cancel()
+	t.mu.Unlock()
+
+	// Don't close the underlying connection - it's shared by the UDPListener
+	return nil
+}
+
+// IsClosed returns whether the transport is closed
+func (t *UDPTransport) IsClosed() bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.closed
+}
+
+// LocalAddr returns the local network address
+func (t *UDPTransport) LocalAddr() net.Addr {
+	if t.conn == nil {
+		return nil
+	}
+	return t.conn.LocalAddr()
+}
+
+// RemoteAddr returns the remote network address
+func (t *UDPTransport) RemoteAddr() net.Addr {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.remoteAddr == nil {
+		return nil
+	}
+	return t.remoteAddr
+}
+
+// UDPListener represents a BFCP server that listens for UDP messages
+type UDPListener struct {
+	conn   *net.UDPConn
+	mu     sync.RWMutex
+	closed bool
+	logger Logger
+
+	// sessions tracks UDP "connections" by remote address
+	sessions map[string]*UDPTransport
+
+	OnMessage func(*UDPTransport, *Message)
+	OnError   func(error)
+
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+// SetLogger sets the logger for this listener
+func (l *UDPListener) SetLogger(log Logger) {
+	l.logger = log
+}
+
+func (l *UDPListener) log() Logger {
+	if l.logger != nil {
+		return l.logger
+	}
+	return NopLogger{}
+}
+
+// ListenUDP creates a new BFCP UDP listener on the specified address
+func ListenUDP(address string) (*UDPListener, error) {
+	addr, err := net.ResolveUDPAddr("udp", address)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve address %s: %w", address, err)
+	}
+
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to listen on %s: %w", address, err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	return &UDPListener{
+		conn:     conn,
+		sessions: make(map[string]*UDPTransport),
+		ctx:      ctx,
+		cancel:   cancel,
+	}, nil
+}
+
+// ListenUDPPortRange creates a new BFCP UDP listener on the first available port in the given range.
+func ListenUDPPortRange(ip string, portMin, portMax int) (*UDPListener, error) {
+	var lastErr error
+	for port := portMin; port < portMax; port++ {
+		address := fmt.Sprintf("%s:%d", ip, port)
+		listener, err := ListenUDP(address)
+		if err == nil {
+			return listener, nil
+		}
+		lastErr = err
+	}
+	return nil, fmt.Errorf("no available UDP port in range %d-%d: %w", portMin, portMax, lastErr)
+}
+
+// Start begins reading messages from the UDP socket
+func (l *UDPListener) Start() {
+	go l.readLoop()
+}
+
+func (l *UDPListener) readLoop() {
+	buf := make([]byte, 65535)
+
+	for {
+		select {
+		case <-l.ctx.Done():
+			return
+		default:
+		}
+
+		// Set read deadline to allow periodic context checks
+		if err := l.conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			l.log().Errorw("bfcp.udp.deadline_failed", err)
+			if l.OnError != nil {
+				l.OnError(fmt.Errorf("failed to set read deadline: %w", err))
+			}
+			return
+		}
+
+		n, remoteAddr, err := l.conn.ReadFromUDP(buf)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			if !l.IsClosed() && l.OnError != nil {
+				l.OnError(fmt.Errorf("failed to read UDP: %w", err))
+			}
+			return
+		}
+
+		// Parse the BFCP message
+		msg, err := Decode(buf[:n])
+		if err != nil {
+			l.log().Warnw("bfcp.udp.decode_failed", err, "remote", remoteAddr.String())
+			continue
+		}
+
+		// Get or create transport for this remote address
+		transport := l.getOrCreateTransport(remoteAddr)
+
+		l.log().Debugw("bfcp.udp.msg.received",
+			"primitive", msg.Primitive.String(),
+			"txID", msg.TransactionID,
+			"remote", remoteAddr.String())
+
+		if l.OnMessage != nil {
+			l.OnMessage(transport, msg)
+		}
+	}
+}
+
+func (l *UDPListener) getOrCreateTransport(remoteAddr *net.UDPAddr) *UDPTransport {
+	key := remoteAddr.String()
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if transport, exists := l.sessions[key]; exists {
+		return transport
+	}
+
+	transport := NewUDPTransport(l.conn, remoteAddr)
+	transport.logger = l.logger
+	l.sessions[key] = transport
+
+	l.log().Debugw("bfcp.udp.session.created", "remote", key)
+	return transport
+}
+
+// GetTransport returns the transport for a specific remote address
+func (l *UDPListener) GetTransport(remoteAddr string) *UDPTransport {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.sessions[remoteAddr]
+}
+
+// RemoveTransport removes a transport from the session map
+func (l *UDPListener) RemoveTransport(remoteAddr string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.sessions, remoteAddr)
+	l.log().Debugw("bfcp.udp.session.removed", "remote", remoteAddr)
+}
+
+// Close closes the UDP listener
+func (l *UDPListener) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.closed {
+		return nil
+	}
+
+	l.closed = true
+	if l.cancel != nil {
+		l.cancel()
+	}
+
+	// Close all sessions
+	for _, transport := range l.sessions {
+		transport.Close()
+	}
+	l.sessions = make(map[string]*UDPTransport)
+
+	if l.conn != nil {
+		return l.conn.Close()
+	}
+
+	return nil
+}
+
+// IsClosed returns whether the listener is closed
+func (l *UDPListener) IsClosed() bool {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.closed
+}
+
+// Addr returns the listener's network address
+func (l *UDPListener) Addr() net.Addr {
+	if l.conn == nil {
+		return nil
+	}
+	return l.conn.LocalAddr()
+}

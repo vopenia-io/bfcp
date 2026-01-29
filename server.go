@@ -9,6 +9,14 @@ import (
 	"time"
 )
 
+// TransportType specifies the BFCP transport protocol
+type TransportType int
+
+const (
+	TransportTCP TransportType = iota // TCP transport (RFC 4582)
+	TransportUDP                      // UDP transport (RFC 8855)
+)
+
 type ServerConfig struct {
 	Address        string
 	PortMin        int // Port range start (used when Address ends with :0)
@@ -18,6 +26,7 @@ type ServerConfig struct {
 	MaxFloors      int
 	SessionTimeout int
 	Logger         Logger
+	Transport      TransportType // Transport type (TCP or UDP), default TCP
 }
 
 func DefaultServerConfig(address string, conferenceID uint32) *ServerConfig {
@@ -32,8 +41,9 @@ func DefaultServerConfig(address string, conferenceID uint32) *ServerConfig {
 }
 
 type Server struct {
-	config   *ServerConfig
-	listener *Listener
+	config      *ServerConfig
+	listener    *Listener    // TCP listener
+	udpListener *UDPListener // UDP listener
 
 	floors   map[uint16]*FloorStateMachine
 	sessions map[string]*Session
@@ -56,7 +66,8 @@ type Server struct {
 }
 
 type Session struct {
-	Transport    *Transport
+	Transport    *Transport    // TCP transport (nil for UDP sessions)
+	UDPTransport *UDPTransport // UDP transport (nil for TCP sessions)
 	StateMachine *SessionStateMachine
 	Server       *Server
 }
@@ -107,6 +118,13 @@ func (s *Server) ReleaseFloor(floorID uint16) {
 // After this returns successfully, Addr() will return the bound address.
 // Call Serve() to start accepting connections.
 func (s *Server) Listen() error {
+	if s.config.Transport == TransportUDP {
+		return s.listenUDP()
+	}
+	return s.listenTCP()
+}
+
+func (s *Server) listenTCP() error {
 	var listener *Listener
 	var err error
 
@@ -120,11 +138,11 @@ func (s *Server) Listen() error {
 	}
 
 	if err != nil {
-		return fmt.Errorf("failed to create listener: %w", err)
+		return fmt.Errorf("failed to create TCP listener: %w", err)
 	}
 
 	s.listener = listener
-	s.logger().Infow("bfcp.server.listening", "addr", s.listener.Addr().String(), "confID", s.config.ConferenceID)
+	s.logger().Infow("bfcp.server.listening", "transport", "TCP", "addr", s.listener.Addr().String(), "confID", s.config.ConferenceID)
 
 	listener.OnConnection = s.handleConnection
 	listener.OnError = func(err error) {
@@ -138,11 +156,47 @@ func (s *Server) Listen() error {
 	return nil
 }
 
+func (s *Server) listenUDP() error {
+	var listener *UDPListener
+	var err error
+
+	// Check if Address ends with :0 and port range is configured
+	if strings.HasSuffix(s.config.Address, ":0") && s.config.PortMin > 0 && s.config.PortMax > 0 {
+		// Extract IP (remove :0 suffix)
+		ip := strings.TrimSuffix(s.config.Address, ":0")
+		listener, err = ListenUDPPortRange(ip, s.config.PortMin, s.config.PortMax)
+	} else {
+		listener, err = ListenUDP(s.config.Address)
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to create UDP listener: %w", err)
+	}
+
+	s.udpListener = listener
+	listener.SetLogger(s.config.Logger)
+	s.logger().Infow("bfcp.server.listening", "transport", "UDP", "addr", s.udpListener.Addr().String(), "confID", s.config.ConferenceID)
+
+	listener.OnMessage = s.handleUDPMessage
+	listener.OnError = func(err error) {
+		if s.OnError != nil {
+			s.OnError(err)
+		} else {
+			s.logger().Warnw("bfcp.udp.listener.error", err)
+		}
+	}
+
+	return nil
+}
+
 // Serve starts accepting connections. This should be called after Listen().
 // This method is non-blocking - it starts the accept loop in a goroutine.
 func (s *Server) Serve() {
 	if s.listener != nil {
 		s.listener.Start()
+	}
+	if s.udpListener != nil {
+		s.udpListener.Start()
 	}
 }
 
@@ -165,11 +219,17 @@ func (s *Server) Close() error {
 	s.mu.RUnlock()
 
 	for _, session := range sessions {
-		session.Transport.Close()
+		if session.Transport != nil {
+			session.Transport.Close()
+		}
 	}
 
 	if s.listener != nil {
 		return s.listener.Close()
+	}
+
+	if s.udpListener != nil {
+		return s.udpListener.Close()
 	}
 
 	return nil
@@ -178,6 +238,9 @@ func (s *Server) Close() error {
 func (s *Server) Addr() net.Addr {
 	if s.listener != nil {
 		return s.listener.Addr()
+	}
+	if s.udpListener != nil {
+		return s.udpListener.Addr()
 	}
 	return nil
 }
@@ -213,6 +276,397 @@ func (s *Server) handleConnection(transport *Transport) {
 	}
 
 	transport.Start()
+}
+
+// handleUDPMessage handles incoming BFCP messages over UDP
+func (s *Server) handleUDPMessage(transport *UDPTransport, msg *Message) {
+	remoteAddr := transport.RemoteAddr().String()
+	s.logger().Debugw("bfcp.udp.msg.recv",
+		"primitive", msg.Primitive.String(),
+		"remote", remoteAddr,
+		"txID", msg.TransactionID)
+
+	// Get or create session for this remote address
+	s.mu.Lock()
+	session, exists := s.sessions[remoteAddr]
+	if !exists {
+		session = &Session{
+			UDPTransport: transport,
+			StateMachine: NewSessionStateMachine(uint16(s.config.ConferenceID), 0, remoteAddr),
+			Server:       s,
+		}
+		// Don't add to sessions map yet - wait for Hello
+	}
+	s.mu.Unlock()
+
+	session.handleUDPMessage(msg)
+}
+
+func (sess *Session) handleUDPMessage(msg *Message) {
+	sess.StateMachine.UpdateActivity()
+	remoteAddr := ""
+	if sess.UDPTransport != nil {
+		remoteAddr = sess.UDPTransport.RemoteAddr().String()
+	}
+
+	sess.Server.logger().Debugw("bfcp.udp.msg.processing",
+		"primitive", msg.Primitive.String(),
+		"remote", remoteAddr,
+		"txID", msg.TransactionID)
+
+	if sess.Server.OnMessageIn != nil {
+		floorID, _ := msg.GetFloorID()
+		sess.Server.OnMessageIn(
+			remoteAddr,
+			msg.Primitive.String(),
+			uint32(msg.TransactionID),
+			msg.ConferenceID,
+			msg.UserID,
+			floorID,
+		)
+	}
+
+	switch msg.Primitive {
+	case PrimitiveHello:
+		sess.handleUDPHello(msg)
+	case PrimitiveFloorRequest:
+		sess.handleUDPFloorRequest(msg)
+	case PrimitiveFloorRelease:
+		sess.handleUDPFloorRelease(msg)
+	case PrimitiveFloorQuery:
+		sess.handleUDPFloorQuery(msg)
+	case PrimitiveGoodbye:
+		sess.handleUDPGoodbye(msg)
+	case PrimitiveFloorRequestStatus,
+		PrimitiveFloorRequestStatusAck,
+		PrimitiveFloorStatus,
+		PrimitiveFloorStatusAck,
+		PrimitiveHelloAck,
+		PrimitiveGoodbyeAck:
+		sess.Server.logger().Debugw("bfcp.udp.msg.ack_ignored", "primitive", msg.Primitive.String())
+	case PrimitiveError:
+		if errorCode, ok := msg.GetErrorCode(); ok {
+			errorInfo, _ := msg.GetErrorInfo()
+			sess.Server.logger().Warnw("bfcp.udp.error.from_client", nil, "errorCode", errorCode.String(), "errorInfo", errorInfo)
+		} else {
+			sess.Server.logger().Warnw("bfcp.udp.error.from_client", nil, "errorCode", "unknown")
+		}
+	default:
+		sess.sendUDPError(msg, ErrorUnknownPrimitive, fmt.Sprintf("Unknown primitive: %d", msg.Primitive))
+	}
+}
+
+func (sess *Session) handleUDPHello(msg *Message) {
+	sess.Server.logger().Debugw("bfcp.udp.hello.processing", "userID", msg.UserID, "confID", msg.ConferenceID)
+
+	sess.StateMachine.ConferenceID = msg.ConferenceID
+	sess.StateMachine.UserID = msg.UserID
+
+	remoteAddr := sess.UDPTransport.RemoteAddr().String()
+	sess.Server.mu.Lock()
+	sess.Server.sessions[remoteAddr] = sess
+	sess.Server.mu.Unlock()
+
+	if attr := msg.GetAttribute(AttrSupportedPrimitives); attr != nil {
+		primitives := make([]Primitive, len(attr.Value))
+		for i, v := range attr.Value {
+			primitives[i] = Primitive(v)
+		}
+		sess.StateMachine.SetSupportedPrimitives(primitives)
+	}
+
+	if attr := msg.GetAttribute(AttrSupportedAttributes); attr != nil {
+		attributes := make([]AttributeType, len(attr.Value))
+		for i, v := range attr.Value {
+			attributes[i] = AttributeType(v)
+		}
+		sess.StateMachine.SetSupportedAttributes(attributes)
+	}
+
+	response := NewMessage(PrimitiveHelloAck, msg.ConferenceID, msg.TransactionID, msg.UserID)
+
+	supportedPrimitives := []Primitive{
+		PrimitiveFloorRequest,
+		PrimitiveFloorRelease,
+		PrimitiveFloorRequestStatus,
+		PrimitiveFloorStatus,
+		PrimitiveHello,
+		PrimitiveHelloAck,
+		PrimitiveError,
+		PrimitiveGoodbye,
+		PrimitiveGoodbyeAck,
+	}
+	response.AddSupportedPrimitives(supportedPrimitives)
+
+	supportedAttributes := []AttributeType{
+		AttrBeneficiaryID,
+		AttrFloorID,
+		AttrFloorRequestID,
+		AttrPriority,
+		AttrRequestStatus,
+		AttrErrorCode,
+		AttrErrorInfo,
+		AttrSupportedAttributes,
+		AttrSupportedPrimitives,
+		AttrUserDisplayName,
+		AttrUserURI,
+		AttrBeneficiaryInfo,
+		AttrFloorRequestInfo,
+		AttrRequestedByInfo,
+		AttrFloorRequestStatus,
+		AttrOverallRequestStatus,
+		AttrParticipantProvidedInfo,
+		AttrStatusInfo,
+	}
+	response.AddSupportedAttributes(supportedAttributes)
+
+	sess.sendUDP(response)
+	sess.StateMachine.SetState(StateWaitFloorRequest)
+
+	if sess.Server.OnClientConnect != nil {
+		sess.Server.OnClientConnect(remoteAddr, msg.UserID)
+	}
+}
+
+func (sess *Session) handleUDPFloorRequest(msg *Message) {
+	sess.Server.logger().Debugw("bfcp.udp.floor_request.processing", "userID", msg.UserID)
+
+	floorID, ok := msg.GetFloorID()
+	if !ok {
+		sess.Server.logger().Warnw("bfcp.udp.floor_request.no_floor_id", nil)
+		sess.sendUDPError(msg, ErrorInvalidFloorID, "No floor ID in request")
+		return
+	}
+
+	floor, exists := sess.Server.GetFloor(floorID)
+	if !exists {
+		sess.Server.logger().Debugw("bfcp.udp.floor.auto_create", "floorID", floorID)
+		floor = sess.Server.CreateFloor(floorID)
+	}
+
+	requestID := uint16(sess.Server.nextTxID.Add(1))
+
+	beneficiaryID, _ := msg.GetBeneficiaryID()
+	if beneficiaryID == 0 {
+		beneficiaryID = msg.UserID
+	}
+
+	priority := PriorityNormal
+	if attr := msg.GetAttribute(AttrPriority); attr != nil && len(attr.Value) >= 2 {
+		priority = Priority(uint16(attr.Value[0])<<8 | uint16(attr.Value[1]))
+	}
+
+	shouldGrant := sess.Server.config.AutoGrant
+	if sess.Server.OnFloorRequest != nil {
+		shouldGrant = sess.Server.OnFloorRequest(floorID, msg.UserID, requestID)
+	}
+
+	status, err := floor.Request(msg.UserID, requestID, priority)
+	if err != nil {
+		sess.Server.logger().Warnw("bfcp.udp.floor_request.failed", err, "userID", msg.UserID, "floorID", floorID)
+		sess.sendUDPError(msg, ErrorUnauthorizedOperation, err.Error())
+		if sess.Server.OnFloorDenied != nil {
+			sess.Server.OnFloorDenied(floorID, msg.UserID, requestID)
+		}
+		return
+	}
+
+	sess.sendUDPFloorStatus(msg, floorID, requestID, status, 0)
+
+	if shouldGrant && status == RequestStatusPending {
+		time.Sleep(150 * time.Millisecond)
+
+		if err := floor.Grant(); err == nil {
+			sess.sendUDPFloorStatus(msg, floorID, requestID, RequestStatusGranted, 0)
+			sess.StateMachine.SetState(StateFloorGranted)
+
+			if sess.Server.OnFloorGranted != nil {
+				sess.Server.OnFloorGranted(floorID, msg.UserID, requestID)
+			}
+		}
+	} else if !shouldGrant && status == RequestStatusPending {
+		if err := floor.Deny(); err == nil {
+			sess.sendUDPFloorStatus(msg, floorID, requestID, RequestStatusDenied, 0)
+			sess.StateMachine.SetState(StateFloorDenied)
+
+			if sess.Server.OnFloorDenied != nil {
+				sess.Server.OnFloorDenied(floorID, msg.UserID, requestID)
+			}
+		}
+	} else {
+		sess.StateMachine.SetState(StateFloorRequested)
+	}
+}
+
+func (sess *Session) handleUDPFloorRelease(msg *Message) {
+	sess.Server.logger().Debugw("bfcp.udp.floor_release.processing", "userID", msg.UserID)
+
+	floorID, ok := msg.GetFloorID()
+	if !ok {
+		sess.sendUDPError(msg, ErrorUnknownMandatoryAttribute, "Missing FLOOR-ID attribute")
+		return
+	}
+
+	floor, exists := sess.Server.GetFloor(floorID)
+	if !exists {
+		sess.sendUDPError(msg, ErrorInvalidFloorID, fmt.Sprintf("Floor %d does not exist", floorID))
+		return
+	}
+
+	requestID, _ := msg.GetFloorRequestID()
+
+	if err := floor.Release(msg.UserID); err != nil {
+		sess.Server.logger().Warnw("bfcp.udp.floor_release.denied", err, "userID", msg.UserID, "floorID", floorID)
+		sess.sendUDPError(msg, ErrorFloorReleaseDenied, err.Error())
+		return
+	}
+
+	sess.sendUDPFloorStatus(msg, floorID, requestID, RequestStatusReleased, 0)
+	sess.StateMachine.SetState(StateFloorReleased)
+
+	if sess.Server.OnFloorReleased != nil {
+		sess.Server.OnFloorReleased(floorID, msg.UserID)
+	}
+
+	sess.Server.broadcastFloorStatusUDP(msg.UserID, floorID, requestID, RequestStatusReleased, 0)
+}
+
+func (sess *Session) handleUDPFloorQuery(msg *Message) {
+	floorID, ok := msg.GetFloorID()
+	if !ok {
+		sess.sendUDPError(msg, ErrorUnknownMandatoryAttribute, "Missing FLOOR-ID attribute")
+		return
+	}
+
+	floor, exists := sess.Server.GetFloor(floorID)
+	if !exists {
+		sess.sendUDPError(msg, ErrorInvalidFloorID, fmt.Sprintf("Floor %d does not exist", floorID))
+		return
+	}
+
+	response := NewMessage(PrimitiveFloorStatus, msg.ConferenceID, msg.TransactionID, msg.UserID)
+	response.AddFloorID(floorID)
+	response.AddFloorRequestID(floor.GetFloorRequestID())
+	response.AddRequestStatus(floor.GetState(), 0)
+
+	sess.sendUDP(response)
+}
+
+func (sess *Session) handleUDPGoodbye(msg *Message) {
+	sess.Server.logger().Debugw("bfcp.udp.goodbye.processing", "userID", msg.UserID)
+
+	sess.Server.mu.RLock()
+	floors := make([]*FloorStateMachine, 0)
+	for _, floor := range sess.Server.floors {
+		if floor.GetOwner() == msg.UserID {
+			floors = append(floors, floor)
+		}
+	}
+	sess.Server.mu.RUnlock()
+
+	for _, floor := range floors {
+		if err := floor.Release(msg.UserID); err == nil {
+			requestID := floor.GetFloorRequestID()
+			sess.Server.broadcastFloorStatusUDP(msg.UserID, floor.FloorID, requestID, RequestStatusReleased, 0)
+
+			if sess.Server.OnFloorReleased != nil {
+				sess.Server.OnFloorReleased(floor.FloorID, msg.UserID)
+			}
+		}
+	}
+
+	response := NewMessage(PrimitiveGoodbyeAck, msg.ConferenceID, msg.TransactionID, msg.UserID)
+	sess.sendUDP(response)
+
+	sess.StateMachine.SetState(StateDisconnected)
+
+	// Remove session from map
+	remoteAddr := sess.UDPTransport.RemoteAddr().String()
+	sess.Server.mu.Lock()
+	delete(sess.Server.sessions, remoteAddr)
+	sess.Server.mu.Unlock()
+
+	if sess.Server.OnClientDisconnect != nil {
+		sess.Server.OnClientDisconnect(remoteAddr, msg.UserID)
+	}
+}
+
+func (sess *Session) sendUDPFloorStatus(req *Message, floorID, requestID uint16, status RequestStatus, queuePos uint8) {
+	response := NewMessage(PrimitiveFloorRequestStatus, req.ConferenceID, req.TransactionID, req.UserID)
+	response.AddFloorRequestInformationRFC4582(requestID, status, floorID)
+	sess.sendUDP(response)
+}
+
+func (sess *Session) sendUDPError(req *Message, errorCode ErrorCode, errorInfo string) {
+	response := NewMessage(PrimitiveError, req.ConferenceID, req.TransactionID, req.UserID)
+	response.AddErrorCode(errorCode)
+	if errorInfo != "" {
+		response.AddErrorInfo(errorInfo)
+	}
+	sess.sendUDP(response)
+	sess.Server.logger().Warnw("bfcp.udp.error.sent", nil, "remote", sess.UDPTransport.RemoteAddr().String(), "errorCode", errorCode.String(), "errorInfo", errorInfo)
+}
+
+func (sess *Session) sendUDP(msg *Message) {
+	if sess.UDPTransport == nil {
+		sess.Server.logger().Errorw("bfcp.udp.send.no_transport", nil)
+		return
+	}
+
+	if err := sess.UDPTransport.SendMessage(msg); err != nil {
+		sess.Server.logger().Errorw("bfcp.udp.msg.send_failed", err,
+			"primitive", msg.Primitive.String(),
+			"remote", sess.UDPTransport.RemoteAddr().String())
+	} else {
+		sess.Server.logger().Debugw("bfcp.udp.msg.sent",
+			"primitive", msg.Primitive.String(),
+			"remote", sess.UDPTransport.RemoteAddr().String(),
+			"txID", msg.TransactionID)
+
+		if sess.Server.OnMessageOut != nil {
+			floorID, _ := msg.GetFloorID()
+			sess.Server.OnMessageOut(
+				sess.UDPTransport.RemoteAddr().String(),
+				msg.Primitive.String(),
+				uint32(msg.TransactionID),
+				msg.ConferenceID,
+				msg.UserID,
+				floorID,
+			)
+		}
+	}
+}
+
+func (sess *Session) sendUDPRaw(data []byte) {
+	if sess.UDPTransport == nil {
+		sess.Server.logger().Errorw("bfcp.udp.send_raw.no_transport", nil)
+		return
+	}
+
+	if err := sess.UDPTransport.SendRawData(data); err != nil {
+		sess.Server.logger().Errorw("bfcp.udp.msg.send_raw_failed", err, "remote", sess.UDPTransport.RemoteAddr().String())
+	}
+}
+
+func (s *Server) broadcastFloorStatusUDP(userID uint16, floorID, requestID uint16, status RequestStatus, queuePos uint8) {
+	s.mu.RLock()
+	sessions := make([]*Session, 0, len(s.sessions))
+	for _, session := range s.sessions {
+		sessions = append(sessions, session)
+	}
+	s.mu.RUnlock()
+
+	for _, session := range sessions {
+		if session.UDPTransport == nil {
+			continue
+		}
+
+		txID := uint16(s.nextTxID.Add(1))
+		msg := NewMessage(PrimitiveFloorRequestStatus, s.config.ConferenceID, txID, userID)
+		msg.AddFloorRequestInformationRFC4582(requestID, status, floorID)
+
+		session.sendUDP(msg)
+	}
 }
 
 func (sess *Session) handleMessage(msg *Message) {
