@@ -572,20 +572,15 @@ func (sess *Session) handleUDPGoodbye(msg *Message) {
 		}
 	}
 
-	response := NewMessage(PrimitiveGoodbyeAck, msg.ConferenceID, msg.TransactionID, msg.UserID)
-	sess.sendUDP(response)
-
-	sess.StateMachine.SetState(StateDisconnected)
-
-	// Remove session from map
-	remoteAddr := sess.UDPTransport.RemoteAddr().String()
-	sess.Server.mu.Lock()
-	delete(sess.Server.sessions, remoteAddr)
-	sess.Server.mu.Unlock()
-
-	if sess.Server.OnClientDisconnect != nil {
-		sess.Server.OnClientDisconnect(remoteAddr, msg.UserID)
-	}
+	// NOTE: We intentionally do NOT send GoodbyeAck and do NOT remove the session.
+	// Some clients (like Poly with BFCP Version 1 over UDP) send Goodbye after
+	// receiving server-initiated FloorStatus, but close their BFCP channel upon
+	// receiving GoodbyeAck. By not responding, Poly keeps its channel open and
+	// can still receive subsequent FloorStatus messages (e.g., Released when
+	// screenshare stops). The session will be cleaned up when the SIP call ends.
+	sess.Server.logger().Debugw("bfcp.udp.goodbye.ignored_keeping_session_alive",
+		"remote", sess.UDPTransport.RemoteAddr().String(),
+		"userID", msg.UserID)
 }
 
 func (sess *Session) sendUDPFloorStatus(req *Message, floorID, requestID uint16, status RequestStatus, queuePos uint8) {
@@ -1071,7 +1066,14 @@ func (s *Server) broadcastFloorState(floorID uint16, beneficiaryID uint16, statu
 	s.mu.RUnlock()
 
 	for _, session := range sessions {
-		txID := uint16(s.nextTxID.Add(1))
+		var txID uint16
+		if session.UDPTransport != nil {
+			// UDP: Server-initiated transactions MUST use Transaction ID = 0 (RFC 8855)
+			txID = uint16(0)
+		} else {
+			// TCP: Use incrementing Transaction ID for TCP sessions
+			txID = uint16(s.nextTxID.Add(1))
+		}
 		requestID := uint16(1) // Synthetic request ID for virtual client notification
 		clientVersion := session.ProtocolVersion()
 
