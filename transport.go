@@ -589,11 +589,6 @@ func (t *UDPTransport) SendMessage(msg *Message) error {
 		return fmt.Errorf("failed to write message: %w", err)
 	}
 
-	t.log().Debugw("bfcp.udp.msg.sent",
-		"primitive", msg.Primitive.String(),
-		"txID", msg.TransactionID,
-		"remote", t.remoteAddr.String())
-
 	return nil
 }
 
@@ -615,7 +610,6 @@ func (t *UDPTransport) SendRawData(data []byte) error {
 		return fmt.Errorf("failed to write raw data: %w", err)
 	}
 
-	t.log().Debugw("bfcp.udp.msg.sent_raw", "bytes", len(data), "remote", t.remoteAddr.String())
 	return nil
 }
 

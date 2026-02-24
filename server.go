@@ -350,13 +350,11 @@ func (sess *Session) handleUDPMessage(msg *Message) {
 			sess.Server.logger().Warnw("bfcp.udp.error.from_client", nil, "errorCode", "unknown")
 		}
 	default:
-		sess.sendUDPError(msg, ErrorUnknownPrimitive, fmt.Sprintf("Unknown primitive: %d", msg.Primitive))
+		sess.Server.logger().Warnw("bfcp.udp.unknown_primitive_ignored", nil, "primitive", int(msg.Primitive))
 	}
 }
 
 func (sess *Session) handleUDPHello(msg *Message) {
-	sess.Server.logger().Debugw("bfcp.udp.hello.processing", "userID", msg.UserID, "confID", msg.ConferenceID, "clientVersion", msg.Version)
-
 	sess.StateMachine.ConferenceID = msg.ConferenceID
 	sess.StateMachine.UserID = msg.UserID
 	sess.StateMachine.ClientVersion = msg.Version // Store client's BFCP version for echoing back
@@ -610,11 +608,6 @@ func (sess *Session) sendUDP(msg *Message) {
 			"primitive", msg.Primitive.String(),
 			"remote", sess.UDPTransport.RemoteAddr().String())
 	} else {
-		sess.Server.logger().Debugw("bfcp.udp.msg.sent",
-			"primitive", msg.Primitive.String(),
-			"remote", sess.UDPTransport.RemoteAddr().String(),
-			"txID", msg.TransactionID)
-
 		if sess.Server.OnMessageOut != nil {
 			floorID, _ := msg.GetFloorID()
 			sess.Server.OnMessageOut(
@@ -706,7 +699,7 @@ func (sess *Session) handleMessage(msg *Message) {
 			sess.Server.logger().Warnw("bfcp.error.from_client", nil, "errorCode", "unknown")
 		}
 	default:
-		sess.sendError(msg, ErrorUnknownPrimitive, fmt.Sprintf("Unknown primitive: %d", msg.Primitive))
+		sess.Server.logger().Warnw("bfcp.tcp.unknown_primitive_ignored", nil, "primitive", int(msg.Primitive))
 	}
 }
 
