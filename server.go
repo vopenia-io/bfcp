@@ -116,6 +116,20 @@ func (s *Server) GetFloor(floorID uint16) (*FloorStateMachine, bool) {
 	return floor, exists
 }
 
+// GetFloorByRequestID finds a floor by its current FloorRequestID.
+// Per RFC 4582, FloorRelease uses FLOOR-REQUEST-ID (not FLOOR-ID).
+func (s *Server) GetFloorByRequestID(requestID uint16) (*FloorStateMachine, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for _, floor := range s.floors {
+		if floor.GetFloorRequestID() == requestID {
+			return floor, true
+		}
+	}
+	return nil, false
+}
+
 func (s *Server) ReleaseFloor(floorID uint16) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -498,15 +512,29 @@ func (sess *Session) handleUDPFloorRequest(msg *Message) {
 func (sess *Session) handleUDPFloorRelease(msg *Message) {
 	sess.Server.logger().Debugw("bfcp.udp.floor_release.processing", "userID", msg.UserID)
 
-	floorID, ok := msg.GetFloorID()
-	if !ok {
-		sess.sendUDPError(msg, ErrorUnknownMandatoryAttribute, "Missing FLOOR-ID attribute")
-		return
-	}
+	var floor *FloorStateMachine
+	var floorID uint16
 
-	floor, exists := sess.Server.GetFloor(floorID)
-	if !exists {
-		sess.sendUDPError(msg, ErrorInvalidFloorID, fmt.Sprintf("Floor %d does not exist", floorID))
+	// RFC 4582: FloorRelease uses FLOOR-REQUEST-ID (mandatory).
+	// FLOOR-ID is optional — some devices (e.g. Poly) only send FLOOR-REQUEST-ID.
+	if fid, ok := msg.GetFloorID(); ok {
+		floorID = fid
+		f, exists := sess.Server.GetFloor(floorID)
+		if !exists {
+			sess.sendUDPError(msg, ErrorInvalidFloorID, fmt.Sprintf("Floor %d does not exist", floorID))
+			return
+		}
+		floor = f
+	} else if reqID, ok := msg.GetFloorRequestID(); ok {
+		f, exists := sess.Server.GetFloorByRequestID(reqID)
+		if !exists {
+			sess.sendUDPError(msg, ErrorFloorRequestIDDoesNotExist, fmt.Sprintf("FloorRequestID %d does not exist", reqID))
+			return
+		}
+		floor = f
+		floorID = floor.FloorID
+	} else {
+		sess.sendUDPError(msg, ErrorUnknownMandatoryAttribute, "Missing FLOOR-REQUEST-ID attribute")
 		return
 	}
 
@@ -855,15 +883,29 @@ func (sess *Session) handleFloorRequest(msg *Message) {
 func (sess *Session) handleFloorRelease(msg *Message) {
 	sess.Server.logger().Debugw("bfcp.floor_release.processing", "userID", msg.UserID)
 
-	floorID, ok := msg.GetFloorID()
-	if !ok {
-		sess.sendError(msg, ErrorUnknownMandatoryAttribute, "Missing FLOOR-ID attribute")
-		return
-	}
+	var floor *FloorStateMachine
+	var floorID uint16
 
-	floor, exists := sess.Server.GetFloor(floorID)
-	if !exists {
-		sess.sendError(msg, ErrorInvalidFloorID, fmt.Sprintf("Floor %d does not exist", floorID))
+	// RFC 4582: FloorRelease uses FLOOR-REQUEST-ID (mandatory).
+	// FLOOR-ID is optional — some devices (e.g. Poly) only send FLOOR-REQUEST-ID.
+	if fid, ok := msg.GetFloorID(); ok {
+		floorID = fid
+		f, exists := sess.Server.GetFloor(floorID)
+		if !exists {
+			sess.sendError(msg, ErrorInvalidFloorID, fmt.Sprintf("Floor %d does not exist", floorID))
+			return
+		}
+		floor = f
+	} else if reqID, ok := msg.GetFloorRequestID(); ok {
+		f, exists := sess.Server.GetFloorByRequestID(reqID)
+		if !exists {
+			sess.sendError(msg, ErrorFloorRequestIDDoesNotExist, fmt.Sprintf("FloorRequestID %d does not exist", reqID))
+			return
+		}
+		floor = f
+		floorID = floor.FloorID
+	} else {
+		sess.sendError(msg, ErrorUnknownMandatoryAttribute, "Missing FLOOR-REQUEST-ID attribute")
 		return
 	}
 
