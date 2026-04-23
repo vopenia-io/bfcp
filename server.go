@@ -130,6 +130,20 @@ func (s *Server) GetFloorByRequestID(requestID uint16) (*FloorStateMachine, bool
 	return nil, false
 }
 
+// ListFloors returns a snapshot of all currently registered floors.
+// The returned slice is a copy; the underlying FloorStateMachine values are
+// shared and remain safe to query via their own thread-safe getters.
+func (s *Server) ListFloors() []*FloorStateMachine {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := make([]*FloorStateMachine, 0, len(s.floors))
+	for _, floor := range s.floors {
+		out = append(out, floor)
+	}
+	return out
+}
+
 func (s *Server) ReleaseFloor(floorID uint16) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
