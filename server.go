@@ -368,7 +368,9 @@ func (sess *Session) handleUDPMessage(msg *Message) {
 		PrimitiveFloorStatus,
 		PrimitiveFloorStatusAck,
 		PrimitiveHelloAck,
-		PrimitiveGoodbyeAck:
+		PrimitiveGoodbyeAck,
+		PrimitiveTandbergFloorRequestStatusAck,
+		PrimitiveTandbergFloorStatusAck:
 		sess.Server.logger().Debugw("bfcp.udp.msg.ack_ignored", "primitive", msg.Primitive.String())
 	case PrimitiveError:
 		if errorCode, ok := msg.GetErrorCode(); ok {
@@ -389,6 +391,7 @@ func (sess *Session) handleUDPHello(msg *Message) {
 
 	remoteAddr := sess.UDPTransport.RemoteAddr().String()
 	sess.Server.mu.Lock()
+	_, alreadyRegistered := sess.Server.sessions[remoteAddr]
 	sess.Server.sessions[remoteAddr] = sess
 	sess.Server.mu.Unlock()
 
@@ -448,7 +451,7 @@ func (sess *Session) handleUDPHello(msg *Message) {
 	sess.sendUDP(response)
 	sess.StateMachine.SetState(StateWaitFloorRequest)
 
-	if sess.Server.OnClientConnect != nil {
+	if !alreadyRegistered && sess.Server.OnClientConnect != nil {
 		sess.Server.OnClientConnect(remoteAddr, msg.UserID)
 	}
 }

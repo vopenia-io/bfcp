@@ -752,6 +752,8 @@ func (l *UDPListener) readLoop() {
 			return
 		}
 
+		l.log().Debugw("bfcp.udp.raw", "remote", remoteAddr.String(), "n", n, "hex", fmt.Sprintf("%x", buf[:n]))
+
 		// Parse the BFCP message
 		msg, err := Decode(buf[:n])
 		if err != nil {

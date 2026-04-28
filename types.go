@@ -37,6 +37,12 @@ const (
 	PrimitiveFloorStatusAck       Primitive = 15
 	PrimitiveGoodbye              Primitive = 16
 	PrimitiveGoodbyeAck           Primitive = 17
+
+	// Tandberg-derived BFCP-UDP ACK primitives. Header-only packets
+	// (PayloadLength=0) with byte 0 = 0x30 (Ver=1, bit 4 of the reserved
+	// field set).
+	PrimitiveTandbergFloorRequestStatusAck Primitive = 91 // 0x5B — acks FloorStatus inside a FloorRequest transaction
+	PrimitiveTandbergFloorStatusAck        Primitive = 93 // 0x5D — acks server-initiated FloorStatus
 )
 
 func (p Primitive) String() string {
@@ -75,6 +81,10 @@ func (p Primitive) String() string {
 		return "Goodbye"
 	case PrimitiveGoodbyeAck:
 		return "GoodbyeAck"
+	case PrimitiveTandbergFloorRequestStatusAck:
+		return "TandbergFloorRequestStatusAck"
+	case PrimitiveTandbergFloorStatusAck:
+		return "TandbergFloorStatusAck"
 	default:
 		return fmt.Sprintf("Unknown(%d)", p)
 	}
