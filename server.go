@@ -1049,13 +1049,21 @@ func (sess *Session) send(msg *Message) {
 func (sess *Session) sendRaw(data []byte) {
 	if sess.UDPTransport != nil {
 		if err := sess.UDPTransport.SendRawData(data); err != nil {
-			sess.Server.logger().Errorw("bfcp.msg.send_raw_failed", err, "remote", sess.UDPTransport.RemoteAddr().String())
+			if sess.UDPTransport.IsClosed() {
+				sess.Server.logger().Debugw("bfcp.msg.send_raw_skipped_transport_closed")
+			} else {
+				sess.Server.logger().Errorw("bfcp.msg.send_raw_failed", err, "remote", sess.UDPTransport.RemoteAddr().String())
+			}
 		}
 		return
 	}
 	if sess.Transport != nil {
 		if err := sess.Transport.SendRawData(data); err != nil {
-			sess.Server.logger().Errorw("bfcp.msg.send_raw_failed", err, "remote", sess.Transport.RemoteAddr().String())
+			if sess.Transport.IsClosed() {
+				sess.Server.logger().Debugw("bfcp.msg.send_raw_skipped_transport_closed")
+			} else {
+				sess.Server.logger().Errorw("bfcp.msg.send_raw_failed", err, "remote", sess.Transport.RemoteAddr().String())
+			}
 		}
 		return
 	}
