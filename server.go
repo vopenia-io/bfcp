@@ -59,10 +59,10 @@ type Server struct {
 	OnClientDisconnect func(remoteAddr string, userID uint16)
 	OnError            func(error)
 
-	// OnMessageIn is called for every incoming BFCP message (for logging)
-	OnMessageIn func(remote string, primitive string, transactionID, conferenceID uint32, userID, floorID uint16)
-	// OnMessageOut is called for every outgoing BFCP message (for logging)
-	OnMessageOut func(remote string, primitive string, transactionID, conferenceID uint32, userID, floorID uint16)
+	// OnMessageIn is called for every incoming BFCP message
+	OnMessageIn func(remote string, primitive string, version uint8, transactionID, conferenceID uint32, userID, floorID uint16)
+	// OnMessageOut is called for every outgoing BFCP message
+	OnMessageOut func(remote string, primitive string, version uint8, transactionID, conferenceID uint32, userID, floorID uint16)
 }
 
 type Session struct {
@@ -117,7 +117,6 @@ func (s *Server) GetFloor(floorID uint16) (*FloorStateMachine, bool) {
 }
 
 // GetFloorByRequestID finds a floor by its current FloorRequestID.
-// Per RFC 4582, FloorRelease uses FLOOR-REQUEST-ID (not FLOOR-ID).
 func (s *Server) GetFloorByRequestID(requestID uint16) (*FloorStateMachine, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -131,8 +130,7 @@ func (s *Server) GetFloorByRequestID(requestID uint16) (*FloorStateMachine, bool
 }
 
 // ListFloors returns a snapshot of all currently registered floors.
-// The returned slice is a copy; the underlying FloorStateMachine values are
-// shared and remain safe to query via their own thread-safe getters.
+// The slice is a copy; the FloorStateMachine values are shared.
 func (s *Server) ListFloors() []*FloorStateMachine {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -166,9 +164,7 @@ func (s *Server) listenTCP() error {
 	var listener *Listener
 	var err error
 
-	// Check if Address ends with :0 and port range is configured
 	if strings.HasSuffix(s.config.Address, ":0") && s.config.PortMin > 0 && s.config.PortMax > 0 {
-		// Extract IP (remove :0 suffix)
 		ip := strings.TrimSuffix(s.config.Address, ":0")
 		listener, err = ListenPortRange(ip, s.config.PortMin, s.config.PortMax)
 	} else {
@@ -198,9 +194,7 @@ func (s *Server) listenUDP() error {
 	var listener *UDPListener
 	var err error
 
-	// Check if Address ends with :0 and port range is configured
 	if strings.HasSuffix(s.config.Address, ":0") && s.config.PortMin > 0 && s.config.PortMax > 0 {
-		// Extract IP (remove :0 suffix)
 		ip := strings.TrimSuffix(s.config.Address, ":0")
 		listener, err = ListenUDPPortRange(ip, s.config.PortMin, s.config.PortMax)
 	} else {
@@ -335,6 +329,7 @@ func (s *Server) handleUDPMessage(transport *UDPTransport, msg *Message) {
 
 func (sess *Session) handleUDPMessage(msg *Message) {
 	sess.StateMachine.UpdateActivity()
+	sess.StateMachine.ClientVersion = msg.Version
 	remoteAddr := ""
 	if sess.UDPTransport != nil {
 		remoteAddr = sess.UDPTransport.RemoteAddr().String()
@@ -345,6 +340,7 @@ func (sess *Session) handleUDPMessage(msg *Message) {
 		sess.Server.OnMessageIn(
 			remoteAddr,
 			msg.Primitive.String(),
+			msg.Version,
 			uint32(msg.TransactionID),
 			msg.ConferenceID,
 			msg.UserID,
@@ -387,7 +383,6 @@ func (sess *Session) handleUDPMessage(msg *Message) {
 func (sess *Session) handleUDPHello(msg *Message) {
 	sess.StateMachine.ConferenceID = msg.ConferenceID
 	sess.StateMachine.UserID = msg.UserID
-	sess.StateMachine.ClientVersion = msg.Version // Store client's BFCP version for echoing back
 
 	remoteAddr := sess.UDPTransport.RemoteAddr().String()
 	sess.Server.mu.Lock()
@@ -532,8 +527,7 @@ func (sess *Session) handleUDPFloorRelease(msg *Message) {
 	var floor *FloorStateMachine
 	var floorID uint16
 
-	// RFC 4582: FloorRelease uses FLOOR-REQUEST-ID (mandatory).
-	// FLOOR-ID is optional — some devices (e.g. Poly) only send FLOOR-REQUEST-ID.
+	// floor lookup: FLOOR-ID if present, else FLOOR-REQUEST-ID (RFC 4582)
 	if fid, ok := msg.GetFloorID(); ok {
 		floorID = fid
 		f, exists := sess.Server.GetFloor(floorID)
@@ -615,12 +609,7 @@ func (sess *Session) handleUDPGoodbye(msg *Message) {
 		}
 	}
 
-	// NOTE: We intentionally do NOT send GoodbyeAck and do NOT remove the session.
-	// Some clients (like Poly with BFCP Version 1 over UDP) send Goodbye after
-	// receiving server-initiated FloorStatus, but close their BFCP channel upon
-	// receiving GoodbyeAck. By not responding, Poly keeps its channel open and
-	// can still receive subsequent FloorStatus messages (e.g., Released when
-	// screenshare stops). The session will be cleaned up when the SIP call ends.
+	// no GoodbyeAck; the session lives until the SIP call ends
 	sess.Server.logger().Debugw("bfcp.udp.goodbye.ignored_keeping_session_alive",
 		"remote", sess.UDPTransport.RemoteAddr().String(),
 		"userID", msg.UserID)
@@ -648,6 +637,8 @@ func (sess *Session) sendUDP(msg *Message) {
 		return
 	}
 
+	msg.Version = sess.ProtocolVersion()
+
 	if err := sess.UDPTransport.SendMessage(msg); err != nil {
 		sess.Server.logger().Errorw("bfcp.udp.msg.send_failed", err,
 			"primitive", msg.Primitive.String(),
@@ -658,6 +649,7 @@ func (sess *Session) sendUDP(msg *Message) {
 			sess.Server.OnMessageOut(
 				sess.UDPTransport.RemoteAddr().String(),
 				msg.Primitive.String(),
+				msg.Version,
 				uint32(msg.TransactionID),
 				msg.ConferenceID,
 				msg.UserID,
@@ -701,6 +693,7 @@ func (s *Server) broadcastFloorStatusUDP(userID uint16, floorID, requestID uint1
 
 func (sess *Session) handleMessage(msg *Message) {
 	sess.StateMachine.UpdateActivity()
+	sess.StateMachine.ClientVersion = msg.Version
 	sess.Server.logger().Debugw("bfcp.msg.recv",
 		"primitive", msg.Primitive.String(),
 		"remote", sess.Transport.RemoteAddr().String(),
@@ -711,6 +704,7 @@ func (sess *Session) handleMessage(msg *Message) {
 		sess.Server.OnMessageIn(
 			sess.Transport.RemoteAddr().String(),
 			msg.Primitive.String(),
+			msg.Version,
 			uint32(msg.TransactionID),
 			msg.ConferenceID,
 			msg.UserID,
@@ -753,7 +747,6 @@ func (sess *Session) handleHello(msg *Message) {
 
 	sess.StateMachine.ConferenceID = msg.ConferenceID
 	sess.StateMachine.UserID = msg.UserID
-	sess.StateMachine.ClientVersion = msg.Version // Store client's BFCP version for echoing back
 
 	remoteAddr := sess.Transport.RemoteAddr().String()
 	sess.Server.mu.Lock()
@@ -903,8 +896,7 @@ func (sess *Session) handleFloorRelease(msg *Message) {
 	var floor *FloorStateMachine
 	var floorID uint16
 
-	// RFC 4582: FloorRelease uses FLOOR-REQUEST-ID (mandatory).
-	// FLOOR-ID is optional — some devices (e.g. Poly) only send FLOOR-REQUEST-ID.
+	// floor lookup: FLOOR-ID if present, else FLOOR-REQUEST-ID (RFC 4582)
 	if fid, ok := msg.GetFloorID(); ok {
 		floorID = fid
 		f, exists := sess.Server.GetFloor(floorID)
@@ -997,7 +989,6 @@ func (sess *Session) handleGoodbye(msg *Message) {
 
 func (sess *Session) sendFloorStatus(req *Message, floorID, requestID uint16, status RequestStatus, queuePos uint8) {
 	response := NewMessage(PrimitiveFloorRequestStatus, req.ConferenceID, req.TransactionID, req.UserID)
-	// Use RFC 4582/8855 compliant FLOOR-REQUEST-INFORMATION grouped attribute with proper 2-byte header IDs
 	response.AddFloorRequestInformationRFC4582(requestID, status, floorID)
 	sess.send(response)
 }
@@ -1013,7 +1004,6 @@ func (sess *Session) sendError(req *Message, errorCode ErrorCode, errorInfo stri
 }
 
 func (sess *Session) send(msg *Message) {
-	// Handle both TCP and UDP transports
 	if sess.UDPTransport != nil {
 		sess.sendUDP(msg)
 		return
@@ -1022,6 +1012,7 @@ func (sess *Session) send(msg *Message) {
 		sess.Server.logger().Errorw("bfcp.msg.send_failed", nil, "error", "no transport available")
 		return
 	}
+	msg.Version = sess.ProtocolVersion()
 	if err := sess.Transport.SendMessage(msg); err != nil {
 		sess.Server.logger().Errorw("bfcp.msg.send_failed", err,
 			"primitive", msg.Primitive.String(),
@@ -1037,6 +1028,7 @@ func (sess *Session) send(msg *Message) {
 			sess.Server.OnMessageOut(
 				sess.Transport.RemoteAddr().String(),
 				msg.Primitive.String(),
+				msg.Version,
 				uint32(msg.TransactionID),
 				msg.ConferenceID,
 				msg.UserID,
@@ -1079,8 +1071,6 @@ func (s *Server) GrantFloor(floorID, userID uint16) error {
 }
 
 // BroadcastFloorStatus sends a FloorRequestStatus message to all connected BFCP clients.
-// This is used to notify clients when the floor state changes (e.g., when a virtual
-// client takes or releases the floor).
 func (s *Server) BroadcastFloorStatus(userID uint16, floorID, requestID uint16, status RequestStatus, queuePos uint8) {
 	s.broadcastFloorStatus(userID, floorID, requestID, status, queuePos)
 }
@@ -1096,23 +1086,14 @@ func (s *Server) broadcastFloorStatus(userID uint16, floorID, requestID uint16, 
 	for _, session := range sessions {
 		txID := uint16(s.nextTxID.Add(1))
 		msg := NewMessage(PrimitiveFloorRequestStatus, s.config.ConferenceID, txID, userID)
-		// Use RFC 4582/8855 compliant FLOOR-REQUEST-INFORMATION grouped attribute with proper 2-byte header IDs
 		msg.AddFloorRequestInformationRFC4582(requestID, status, floorID)
 
 		session.send(msg)
 	}
 }
 
-// BroadcastFloorState sends a FloorStatus message to all connected BFCP clients.
-// Unlike FloorRequestStatus (which responds to a specific floor request), FloorStatus
-// is a general notification about floor state. This is appropriate when notifying
-// clients about floor changes that don't correspond to their own requests (e.g.,
-// when a virtual client takes the floor).
-//
-// Per RFC 8855, FloorStatus contains:
-// - FLOOR-ID: the floor being reported on
-// - BENEFICIARY-ID: optional, indicates who holds the floor (if granted)
-// - REQUEST-STATUS: the current status (Granted, Released, etc.)
+// BroadcastFloorState sends a FloorStatus message (FLOOR-ID, optional
+// BENEFICIARY-ID, REQUEST-STATUS) to all connected BFCP clients.
 func (s *Server) BroadcastFloorState(floorID uint16, beneficiaryID uint16, status RequestStatus) {
 	s.broadcastFloorState(floorID, beneficiaryID, status)
 }
@@ -1128,17 +1109,14 @@ func (s *Server) broadcastFloorState(floorID uint16, beneficiaryID uint16, statu
 	for _, session := range sessions {
 		var txID uint16
 		if session.UDPTransport != nil {
-			// UDP: Server-initiated transactions MUST use Transaction ID = 0 (RFC 8855)
+			// server-initiated UDP transactions carry Transaction ID 0 (RFC 8855)
 			txID = uint16(0)
 		} else {
-			// TCP: Use incrementing Transaction ID for TCP sessions
 			txID = uint16(s.nextTxID.Add(1))
 		}
-		requestID := uint16(1) // Synthetic request ID for virtual client notification
+		requestID := uint16(1) // synthetic request ID for virtual client notification
 		clientVersion := session.ProtocolVersion()
 
-		// Use FloorStatus (primitive 8) for all sessions - both TCP and UDP
-		// This is the standard BFCP notification primitive that both Cisco and Poly understand
 		encoded := BuildFloorStatusMessage(
 			clientVersion,
 			s.config.ConferenceID,
@@ -1150,6 +1128,24 @@ func (s *Server) broadcastFloorState(floorID uint16, beneficiaryID uint16, statu
 		)
 
 		session.sendRaw(encoded)
+
+		if s.OnMessageOut != nil {
+			remote := ""
+			if session.UDPTransport != nil {
+				remote = session.UDPTransport.RemoteAddr().String()
+			} else if session.Transport != nil {
+				remote = session.Transport.RemoteAddr().String()
+			}
+			s.OnMessageOut(
+				remote,
+				PrimitiveFloorStatus.String(),
+				clientVersion,
+				uint32(txID),
+				s.config.ConferenceID,
+				session.StateMachine.UserID,
+				floorID,
+			)
+		}
 	}
 }
 
