@@ -1107,46 +1107,88 @@ func (s *Server) broadcastFloorState(floorID uint16, beneficiaryID uint16, statu
 	s.mu.RUnlock()
 
 	for _, session := range sessions {
-		var txID uint16
-		if session.UDPTransport != nil {
-			// server-initiated UDP transactions carry Transaction ID 0 (RFC 8855)
-			txID = uint16(0)
-		} else {
-			txID = uint16(s.nextTxID.Add(1))
-		}
-		requestID := uint16(1) // synthetic request ID for virtual client notification
-		clientVersion := session.ProtocolVersion()
+		s.sendFloorState(session, floorID, status)
+	}
+}
 
-		encoded := BuildFloorStatusMessage(
+// sendFloorState sends a server-initiated FloorStatus for floorID to one session.
+func (s *Server) sendFloorState(session *Session, floorID uint16, status RequestStatus) {
+	var txID uint16
+	if session.UDPTransport != nil {
+		// server-initiated UDP transactions carry Transaction ID 0 (RFC 8855)
+		txID = uint16(0)
+	} else {
+		txID = uint16(s.nextTxID.Add(1))
+	}
+	requestID := uint16(1) // synthetic request ID for virtual client notification
+	clientVersion := session.ProtocolVersion()
+
+	encoded := BuildFloorStatusMessage(
+		clientVersion,
+		s.config.ConferenceID,
+		txID,
+		session.StateMachine.UserID,
+		floorID,
+		requestID,
+		status,
+	)
+
+	session.sendRaw(encoded)
+
+	if s.OnMessageOut != nil {
+		remote := ""
+		if session.UDPTransport != nil {
+			remote = session.UDPTransport.RemoteAddr().String()
+		} else if session.Transport != nil {
+			remote = session.Transport.RemoteAddr().String()
+		}
+		s.OnMessageOut(
+			remote,
+			PrimitiveFloorStatus.String(),
 			clientVersion,
+			uint32(txID),
 			s.config.ConferenceID,
-			txID,
 			session.StateMachine.UserID,
 			floorID,
-			requestID,
-			status,
 		)
-
-		session.sendRaw(encoded)
-
-		if s.OnMessageOut != nil {
-			remote := ""
-			if session.UDPTransport != nil {
-				remote = session.UDPTransport.RemoteAddr().String()
-			} else if session.Transport != nil {
-				remote = session.Transport.RemoteAddr().String()
-			}
-			s.OnMessageOut(
-				remote,
-				PrimitiveFloorStatus.String(),
-				clientVersion,
-				uint32(txID),
-				s.config.ConferenceID,
-				session.StateMachine.UserID,
-				floorID,
-			)
-		}
 	}
+}
+
+// RegisterClient pre-registers the UDP session for remoteAddr (idempotent) and
+// sends it a FloorStatus for floorID, so the server emits first on the 5-tuple.
+func (s *Server) RegisterClient(remoteAddr string, userID uint16, floorID uint16, version uint8) error {
+	if s.udpListener == nil {
+		return fmt.Errorf("no UDP listener")
+	}
+	udpAddr, err := net.ResolveUDPAddr("udp", remoteAddr)
+	if err != nil {
+		return fmt.Errorf("failed to resolve remote address %s: %w", remoteAddr, err)
+	}
+	key := udpAddr.String()
+
+	transport := s.udpListener.getOrCreateTransport(udpAddr)
+
+	s.mu.Lock()
+	session, exists := s.sessions[key]
+	if !exists {
+		session = &Session{
+			UDPTransport: transport,
+			StateMachine: NewSessionStateMachine(uint16(s.config.ConferenceID), userID, key),
+			Server:       s,
+		}
+		session.StateMachine.ClientVersion = version
+		s.sessions[key] = session
+	}
+	s.mu.Unlock()
+
+	s.logger().Infow("bfcp.client.registered", "remote", key, "userID", userID, "version", version, "preexisting", exists)
+
+	status := RequestStatusReleased
+	if floor, ok := s.GetFloor(floorID); ok {
+		status = floor.GetState()
+	}
+	s.sendFloorState(session, floorID, status)
+	return nil
 }
 
 func (s *Server) logger() Logger {
