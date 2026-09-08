@@ -132,7 +132,7 @@ func buildSimpleAttr(attrType uint8, mandatory bool, value []byte) []byte {
 
 	out := make([]byte, total)
 	out[0] = header
-	out[1] = byte(total) // RFC 4582 v1: length in bytes (includes Type+Length+Value+padding)
+	out[1] = byte(l) // octets, padding excluded (RFC 8855 section 5.2)
 	copy(out[2:], value)
 	// padding is already zero
 	return out
@@ -160,7 +160,7 @@ func buildGroupedAttr(attrType uint8, mandatory bool, children [][]byte) []byte 
 
 	out := make([]byte, total)
 	out[0] = header
-	out[1] = byte(total) // RFC 4582 v1: length in bytes (includes Type+Length+children+padding)
+	out[1] = byte(size) // octets, padding excluded (RFC 8855 section 5.2)
 	off := 2
 	for _, c := range children {
 		copy(out[off:], c)
@@ -203,7 +203,7 @@ func buildGroupedAttrWithHeaderID(attrType uint8, mandatory bool, headerID uint1
 
 	out := make([]byte, total)
 	out[0] = header
-	out[1] = byte(total) // RFC 4582 v1: length in bytes (includes Type+Length+HeaderID+children+padding)
+	out[1] = byte(size) // octets, padding excluded (RFC 8855 section 5.2)
 	// Header ID in big-endian
 	out[2] = byte(headerID >> 8)
 	out[3] = byte(headerID & 0xFF)
@@ -391,22 +391,30 @@ func (m *Message) GetAttribute(attrType AttributeType) *Attribute {
 	return nil
 }
 
-// GetFloorID extracts the FloorID from FLOOR-ID attribute
+// GetFloorID extracts the FloorID from FLOOR-ID attribute, else from the first
+// FLOOR-REQUEST-STATUS of a FLOOR-REQUEST-INFORMATION
 func (m *Message) GetFloorID() (uint16, bool) {
-	attr := m.GetAttribute(AttrFloorID)
-	if attr == nil || len(attr.Value) < 2 {
-		return 0, false
+	if attr := m.GetAttribute(AttrFloorID); attr != nil && len(attr.Value) >= 2 {
+		return binary.BigEndian.Uint16(attr.Value), true
 	}
-	return binary.BigEndian.Uint16(attr.Value), true
+	for _, info := range m.FloorRequestInfos() {
+		if len(info.Floors) > 0 {
+			return info.Floors[0].FloorID, true
+		}
+	}
+	return 0, false
 }
 
-// GetFloorRequestID extracts the FloorRequestID from FLOOR-REQUEST-ID attribute
+// GetFloorRequestID extracts the FloorRequestID from FLOOR-REQUEST-ID attribute,
+// else from the first FLOOR-REQUEST-INFORMATION
 func (m *Message) GetFloorRequestID() (uint16, bool) {
-	attr := m.GetAttribute(AttrFloorRequestID)
-	if attr == nil || len(attr.Value) < 2 {
-		return 0, false
+	if attr := m.GetAttribute(AttrFloorRequestID); attr != nil && len(attr.Value) >= 2 {
+		return binary.BigEndian.Uint16(attr.Value), true
 	}
-	return binary.BigEndian.Uint16(attr.Value), true
+	if infos := m.FloorRequestInfos(); len(infos) > 0 {
+		return infos[0].FloorRequestID, true
+	}
+	return 0, false
 }
 
 // GetBeneficiaryID extracts the BeneficiaryID from BENEFICIARY-ID attribute
@@ -418,13 +426,18 @@ func (m *Message) GetBeneficiaryID() (uint16, bool) {
 	return binary.BigEndian.Uint16(attr.Value), true
 }
 
-// GetRequestStatus extracts the RequestStatus from REQUEST-STATUS attribute
+// GetRequestStatus extracts the RequestStatus from REQUEST-STATUS attribute,
+// else from the first FLOOR-REQUEST-INFORMATION
 func (m *Message) GetRequestStatus() (RequestStatus, uint8, bool) {
-	attr := m.GetAttribute(AttrRequestStatus)
-	if attr == nil || len(attr.Value) < 2 {
-		return 0, 0, false
+	if attr := m.GetAttribute(AttrRequestStatus); attr != nil && len(attr.Value) >= 2 {
+		return RequestStatus(attr.Value[0]), attr.Value[1], true
 	}
-	return RequestStatus(attr.Value[0]), attr.Value[1], true
+	for _, info := range m.FloorRequestInfos() {
+		if status, ok := info.Status(); ok {
+			return status, info.QueuePosition, true
+		}
+	}
+	return 0, 0, false
 }
 
 // GetErrorCode extracts the ErrorCode from ERROR-CODE attribute
@@ -520,14 +533,9 @@ func (m *Message) Encode() ([]byte, error) {
 			buf[offset] = (uint8(attr.Type) << 1) | 0x01
 			offset++
 
-			// Length (1 byte)
-			// RFC 4582 v1: Length includes Type(1) + Length(1) + Value
-			// RFC 8855 v2: Length is only the value size
-			lengthField := attr.Length
-			if m.Version == ProtocolVersionRFC4582 {
-				lengthField = attr.Length + 2 // Add 2 for Type+Length header
-			}
-			buf[offset] = lengthField
+			// Length (1 byte): Type + Length + Value in octets, padding excluded
+			// (RFC 8855 section 5.2, same rule as RFC 4582)
+			buf[offset] = attr.Length + 2
 			offset++
 
 			// Value (Length bytes)
@@ -604,17 +612,12 @@ func Decode(data []byte) (*Message, error) {
 		attrLength := data[offset]
 		offset++
 
-		// RFC 4582 (v1) vs RFC 8855 (v2) length interpretation differs:
-		// v1: Length includes Type+Length header, v2: Length is value size only
-		var valueLength int
-		if msg.Version == ProtocolVersionRFC4582 {
-			if attrLength < 2 {
-				return nil, fmt.Errorf("invalid RFC 4582 attribute length: %d (must be >= 2)", attrLength)
-			}
-			valueLength = int(attrLength) - 2
-		} else {
-			valueLength = int(attrLength)
+		// Length covers Type + Length + Value in octets, padding excluded
+		// (RFC 8855 section 5.2, same rule as RFC 4582)
+		if attrLength < 2 {
+			return nil, fmt.Errorf("invalid attribute length: %d (must be >= 2)", attrLength)
 		}
+		valueLength := int(attrLength) - 2
 
 		if offset+valueLength > endOffset {
 			return nil, fmt.Errorf("attribute value exceeds message bounds at offset %d: need %d bytes, have %d",
@@ -632,15 +635,7 @@ func Decode(data []byte) (*Message, error) {
 		})
 
 		// Skip padding to 4-byte boundary
-		// For v1: padding is based on original attrLength
-		// For v2: padding is based on Type+Length+Value = 2+valueLength
-		var attrTotalLen int
-		if msg.Version == ProtocolVersionRFC4582 {
-			attrTotalLen = int(attrLength)
-		} else {
-			attrTotalLen = 2 + valueLength
-		}
-		if padding := attrTotalLen % 4; padding != 0 {
+		if padding := int(attrLength) % 4; padding != 0 {
 			offset += 4 - padding
 		}
 	}

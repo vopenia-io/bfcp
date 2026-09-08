@@ -45,9 +45,10 @@ type Server struct {
 	listener    *Listener    // TCP listener
 	udpListener *UDPListener // UDP listener
 
-	floors   map[uint16]*FloorStateMachine
-	sessions map[string]*Session
-	mu       sync.RWMutex
+	floors     map[uint16]*FloorStateMachine
+	sessions   map[string]*Session
+	udpClients map[string]*UDPClient
+	mu         sync.RWMutex
 
 	nextTxID atomic.Uint32
 
@@ -88,9 +89,10 @@ func NewServer(config *ServerConfig) *Server {
 	}
 
 	return &Server{
-		config:   config,
-		floors:   make(map[uint16]*FloorStateMachine),
-		sessions: make(map[string]*Session),
+		config:     config,
+		floors:     make(map[uint16]*FloorStateMachine),
+		sessions:   make(map[string]*Session),
+		udpClients: make(map[string]*UDPClient),
 	}
 }
 
@@ -313,6 +315,18 @@ func (s *Server) handleConnection(transport *Transport) {
 func (s *Server) handleUDPMessage(transport *UDPTransport, msg *Message) {
 	remoteAddr := transport.RemoteAddr().String()
 
+	s.mu.RLock()
+	client := s.udpClients[remoteAddr]
+	s.mu.RUnlock()
+	if client != nil {
+		if s.OnMessageIn != nil {
+			floorID, _ := msg.GetFloorID()
+			s.OnMessageIn(remoteAddr, msg.Primitive.String(), msg.Version, uint32(msg.TransactionID), msg.ConferenceID, msg.UserID, floorID)
+		}
+		client.handleMessage(msg)
+		return
+	}
+
 	s.mu.Lock()
 	session, exists := s.sessions[remoteAddr]
 	if !exists {
@@ -407,6 +421,7 @@ func (sess *Session) handleUDPHello(msg *Message) {
 	}
 
 	response := NewMessage(PrimitiveHelloAck, msg.ConferenceID, msg.TransactionID, msg.UserID)
+	response.SetResponse(true)
 
 	supportedPrimitives := []Primitive{
 		PrimitiveFloorRequest,
@@ -494,7 +509,7 @@ func (sess *Session) handleUDPFloorRequest(msg *Message) {
 		return
 	}
 
-	sess.sendUDPFloorStatus(msg, floorID, requestID, status, 0)
+	sess.sendUDPFloorStatusResponse(msg, floorID, requestID, status)
 
 	if shouldGrant && status == RequestStatusPending {
 		time.Sleep(150 * time.Millisecond)
@@ -557,7 +572,7 @@ func (sess *Session) handleUDPFloorRelease(msg *Message) {
 		return
 	}
 
-	sess.sendUDPFloorStatus(msg, floorID, requestID, RequestStatusReleased, 0)
+	sess.sendUDPFloorStatusResponse(msg, floorID, requestID, RequestStatusReleased)
 	sess.StateMachine.SetState(StateFloorReleased)
 
 	if sess.Server.OnFloorReleased != nil {
@@ -581,6 +596,7 @@ func (sess *Session) handleUDPFloorQuery(msg *Message) {
 	}
 
 	response := NewMessage(PrimitiveFloorStatus, msg.ConferenceID, msg.TransactionID, msg.UserID)
+	response.SetResponse(true)
 	response.AddFloorID(floorID)
 	response.AddFloorRequestID(floor.GetFloorRequestID())
 	response.AddRequestStatus(floor.GetState(), 0)
@@ -621,8 +637,18 @@ func (sess *Session) sendUDPFloorStatus(req *Message, floorID, requestID uint16,
 	sess.sendUDP(response)
 }
 
+// sendUDPFloorStatusResponse answers a client request (R flag set, RFC 8855
+// section 5.1); later status changes go through sendUDPFloorStatus.
+func (sess *Session) sendUDPFloorStatusResponse(req *Message, floorID, requestID uint16, status RequestStatus) {
+	response := NewMessage(PrimitiveFloorRequestStatus, req.ConferenceID, req.TransactionID, req.UserID)
+	response.SetResponse(true)
+	response.AddFloorRequestInformationRFC4582(requestID, status, floorID)
+	sess.sendUDP(response)
+}
+
 func (sess *Session) sendUDPError(req *Message, errorCode ErrorCode, errorInfo string) {
 	response := NewMessage(PrimitiveError, req.ConferenceID, req.TransactionID, req.UserID)
+	response.SetResponse(true)
 	response.AddErrorCode(errorCode)
 	if errorInfo != "" {
 		response.AddErrorInfo(errorInfo)
@@ -638,6 +664,9 @@ func (sess *Session) sendUDP(msg *Message) {
 	}
 
 	msg.Version = sess.ProtocolVersion()
+	if msg.Version != ProtocolVersionRFC8855 {
+		msg.SetResponse(false)
+	}
 
 	if err := sess.UDPTransport.SendMessage(msg); err != nil {
 		sess.Server.logger().Errorw("bfcp.udp.msg.send_failed", err,
