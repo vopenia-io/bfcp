@@ -100,8 +100,13 @@ func (c *releaseTestClient) requestGranted() uint16 {
 	msg := NewMessage(PrimitiveFloorRequest, 1, c.tid, 1)
 	msg.AddFloorID(1)
 	c.send(msg)
-	c.expectStatus(RequestStatusPending)
-	_, requestID := c.expectStatus(RequestStatusGranted)
+	tid, requestID := c.expectStatus(RequestStatusGranted)
+	if tid != c.tid {
+		c.t.Fatalf("granted in transaction %d, want %d", tid, c.tid)
+	}
+	if extra := c.readMaybe(300 * time.Millisecond); extra != nil {
+		c.t.Fatalf("unexpected %s (transaction %d) after the grant", extra.Primitive, extra.TransactionID)
+	}
 	return requestID
 }
 

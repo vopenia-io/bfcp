@@ -41,7 +41,6 @@ func TestUDPClientRequestAndRelease(t *testing.T) {
 
 	var mu sync.Mutex
 	var remoteGranted, remoteReleased, clientGranted, clientReleased bool
-	var ackPrimitives []string
 	remote.OnFloorGranted = func(floorID, userID, requestID uint16) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -51,11 +50,6 @@ func TestUDPClientRequestAndRelease(t *testing.T) {
 		mu.Lock()
 		defer mu.Unlock()
 		remoteReleased = floorID == 0 && userID == 2
-	}
-	remote.OnMessageIn = func(_ string, primitive string, _ uint8, _, _ uint32, _, _ uint16) {
-		mu.Lock()
-		defer mu.Unlock()
-		ackPrimitives = append(ackPrimitives, primitive)
 	}
 	remote.Serve()
 	local.Serve()
@@ -112,19 +106,6 @@ func TestUDPClientRequestAndRelease(t *testing.T) {
 	if client.HasFloor(0) {
 		t.Fatal("client should not hold floor 0 after release")
 	}
-
-	// the server-initiated Granted notification that followed the Pending
-	// response was acknowledged
-	waitFor(t, "FloorRequestStatusAck", func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		for _, p := range ackPrimitives {
-			if p == PrimitiveFloorRequestStatusAck.String() {
-				return true
-			}
-		}
-		return false
-	})
 }
 
 // A FloorStatus pushed by the server for another user's request is reported

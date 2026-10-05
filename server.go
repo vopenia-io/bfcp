@@ -522,31 +522,28 @@ func (sess *Session) handleUDPFloorRequest(msg *Message) {
 		return
 	}
 
-	sess.sendUDPFloorStatusResponse(msg, floorID, requestID, status)
+	// The decision goes in the response itself: one FloorRequestStatus per request.
+	if shouldGrant && status == RequestStatusPending && floor.Grant() == nil {
+		sess.sendUDPFloorStatusResponse(msg, floorID, requestID, RequestStatusGranted)
+		sess.StateMachine.SetState(StateFloorGranted)
 
-	if shouldGrant && status == RequestStatusPending {
-		time.Sleep(150 * time.Millisecond)
-
-		if err := floor.Grant(); err == nil {
-			sess.sendUDPFloorStatus(msg, floorID, requestID, RequestStatusGranted, 0)
-			sess.StateMachine.SetState(StateFloorGranted)
-
-			if sess.Server.OnFloorGranted != nil {
-				sess.Server.OnFloorGranted(floorID, msg.UserID, requestID)
-			}
+		if sess.Server.OnFloorGranted != nil {
+			sess.Server.OnFloorGranted(floorID, msg.UserID, requestID)
 		}
-	} else if !shouldGrant && status == RequestStatusPending {
-		if err := floor.Deny(); err == nil {
-			sess.sendUDPFloorStatus(msg, floorID, requestID, RequestStatusDenied, 0)
-			sess.StateMachine.SetState(StateFloorDenied)
-
-			if sess.Server.OnFloorDenied != nil {
-				sess.Server.OnFloorDenied(floorID, msg.UserID, requestID)
-			}
-		}
-	} else {
-		sess.StateMachine.SetState(StateFloorRequested)
+		return
 	}
+	if !shouldGrant && status == RequestStatusPending && floor.Deny() == nil {
+		sess.sendUDPFloorStatusResponse(msg, floorID, requestID, RequestStatusDenied)
+		sess.StateMachine.SetState(StateFloorDenied)
+
+		if sess.Server.OnFloorDenied != nil {
+			sess.Server.OnFloorDenied(floorID, msg.UserID, requestID)
+		}
+		return
+	}
+
+	sess.sendUDPFloorStatusResponse(msg, floorID, requestID, status)
+	sess.StateMachine.SetState(StateFloorRequested)
 }
 
 func (sess *Session) handleUDPFloorRelease(msg *Message) {
@@ -648,14 +645,8 @@ func (sess *Session) handleUDPGoodbye(msg *Message) {
 		"userID", msg.UserID)
 }
 
-func (sess *Session) sendUDPFloorStatus(req *Message, floorID, requestID uint16, status RequestStatus, queuePos uint8) {
-	response := NewMessage(PrimitiveFloorRequestStatus, req.ConferenceID, req.TransactionID, req.UserID)
-	response.AddFloorRequestInformationRFC4582(requestID, status, floorID)
-	sess.sendUDP(response)
-}
-
 // sendUDPFloorStatusResponse answers a client request (R flag set, RFC 8855
-// section 5.1); later status changes go through sendUDPFloorStatus.
+// section 5.1).
 func (sess *Session) sendUDPFloorStatusResponse(req *Message, floorID, requestID uint16, status RequestStatus) {
 	response := NewMessage(PrimitiveFloorRequestStatus, req.ConferenceID, req.TransactionID, req.UserID)
 	response.SetResponse(true)
