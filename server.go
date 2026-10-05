@@ -131,6 +131,19 @@ func (s *Server) GetFloorByRequestID(requestID uint16) (*FloorStateMachine, bool
 	return nil, false
 }
 
+// floorOwnedBy finds a floor pending or granted for userID.
+func (s *Server) floorOwnedBy(userID uint16) (*FloorStateMachine, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for _, floor := range s.floors {
+		if !floor.IsAvailable() && floor.GetOwner() == userID {
+			return floor, true
+		}
+	}
+	return nil, false
+}
+
 // ListFloors returns a snapshot of all currently registered floors.
 // The slice is a copy; the FloorStateMachine values are shared.
 func (s *Server) ListFloors() []*FloorStateMachine {
@@ -554,8 +567,12 @@ func (sess *Session) handleUDPFloorRelease(msg *Message) {
 	} else if reqID, ok := msg.GetFloorRequestID(); ok {
 		f, exists := sess.Server.GetFloorByRequestID(reqID)
 		if !exists {
-			sess.sendUDPError(msg, ErrorFloorRequestIDDoesNotExist, fmt.Sprintf("FloorRequestID %d does not exist", reqID))
-			return
+			f, exists = sess.Server.floorOwnedBy(msg.UserID)
+			if !exists {
+				sess.sendUDPError(msg, ErrorFloorRequestIDDoesNotExist, fmt.Sprintf("FloorRequestID %d does not exist", reqID))
+				return
+			}
+			sess.Server.logger().Warnw("bfcp.udp.floor_release.stale_request_id", nil, "userID", msg.UserID, "floorRequestID", reqID, "currentFloorRequestID", f.GetFloorRequestID())
 		}
 		floor = f
 		floorID = floor.FloorID
@@ -579,7 +596,7 @@ func (sess *Session) handleUDPFloorRelease(msg *Message) {
 		sess.Server.OnFloorReleased(floorID, msg.UserID)
 	}
 
-	sess.Server.broadcastFloorStatusUDP(msg.UserID, floorID, requestID, RequestStatusReleased, 0)
+	sess.Server.broadcastFloorStatusUDP(sess, msg.UserID, floorID, requestID, RequestStatusReleased, 0)
 }
 
 func (sess *Session) handleUDPFloorQuery(msg *Message) {
@@ -617,7 +634,7 @@ func (sess *Session) handleUDPGoodbye(msg *Message) {
 	for _, floor := range floors {
 		if err := floor.Release(msg.UserID); err == nil {
 			requestID := floor.GetFloorRequestID()
-			sess.Server.broadcastFloorStatusUDP(msg.UserID, floor.FloorID, requestID, RequestStatusReleased, 0)
+			sess.Server.broadcastFloorStatusUDP(sess, msg.UserID, floor.FloorID, requestID, RequestStatusReleased, 0)
 
 			if sess.Server.OnFloorReleased != nil {
 				sess.Server.OnFloorReleased(floor.FloorID, msg.UserID)
@@ -699,7 +716,8 @@ func (sess *Session) sendUDPRaw(data []byte) {
 	}
 }
 
-func (s *Server) broadcastFloorStatusUDP(userID uint16, floorID, requestID uint16, status RequestStatus, queuePos uint8) {
+// broadcastFloorStatusUDP sends a FloorRequestStatus to every UDP session but except.
+func (s *Server) broadcastFloorStatusUDP(except *Session, userID uint16, floorID, requestID uint16, status RequestStatus, queuePos uint8) {
 	s.mu.RLock()
 	sessions := make([]*Session, 0, len(s.sessions))
 	for _, session := range s.sessions {
@@ -708,7 +726,7 @@ func (s *Server) broadcastFloorStatusUDP(userID uint16, floorID, requestID uint1
 	s.mu.RUnlock()
 
 	for _, session := range sessions {
-		if session.UDPTransport == nil {
+		if session == except || session.UDPTransport == nil {
 			continue
 		}
 
@@ -937,8 +955,12 @@ func (sess *Session) handleFloorRelease(msg *Message) {
 	} else if reqID, ok := msg.GetFloorRequestID(); ok {
 		f, exists := sess.Server.GetFloorByRequestID(reqID)
 		if !exists {
-			sess.sendError(msg, ErrorFloorRequestIDDoesNotExist, fmt.Sprintf("FloorRequestID %d does not exist", reqID))
-			return
+			f, exists = sess.Server.floorOwnedBy(msg.UserID)
+			if !exists {
+				sess.sendError(msg, ErrorFloorRequestIDDoesNotExist, fmt.Sprintf("FloorRequestID %d does not exist", reqID))
+				return
+			}
+			sess.Server.logger().Warnw("bfcp.floor_release.stale_request_id", nil, "userID", msg.UserID, "floorRequestID", reqID, "currentFloorRequestID", f.GetFloorRequestID())
 		}
 		floor = f
 		floorID = floor.FloorID
@@ -962,7 +984,7 @@ func (sess *Session) handleFloorRelease(msg *Message) {
 		sess.Server.OnFloorReleased(floorID, msg.UserID)
 	}
 
-	sess.Server.broadcastFloorStatus(msg.UserID, floorID, requestID, RequestStatusReleased, 0)
+	sess.Server.broadcastFloorStatus(sess, msg.UserID, floorID, requestID, RequestStatusReleased, 0)
 }
 
 func (sess *Session) handleFloorQuery(msg *Message) {
@@ -1001,7 +1023,7 @@ func (sess *Session) handleGoodbye(msg *Message) {
 	for _, floor := range floors {
 		if err := floor.Release(msg.UserID); err == nil {
 			requestID := floor.GetFloorRequestID()
-			sess.Server.broadcastFloorStatus(msg.UserID, floor.FloorID, requestID, RequestStatusReleased, 0)
+			sess.Server.broadcastFloorStatus(sess, msg.UserID, floor.FloorID, requestID, RequestStatusReleased, 0)
 
 			if sess.Server.OnFloorReleased != nil {
 				sess.Server.OnFloorReleased(floor.FloorID, msg.UserID)
@@ -1101,10 +1123,11 @@ func (s *Server) GrantFloor(floorID, userID uint16) error {
 
 // BroadcastFloorStatus sends a FloorRequestStatus message to all connected BFCP clients.
 func (s *Server) BroadcastFloorStatus(userID uint16, floorID, requestID uint16, status RequestStatus, queuePos uint8) {
-	s.broadcastFloorStatus(userID, floorID, requestID, status, queuePos)
+	s.broadcastFloorStatus(nil, userID, floorID, requestID, status, queuePos)
 }
 
-func (s *Server) broadcastFloorStatus(userID uint16, floorID, requestID uint16, status RequestStatus, queuePos uint8) {
+// broadcastFloorStatus sends a FloorRequestStatus to every session but except.
+func (s *Server) broadcastFloorStatus(except *Session, userID uint16, floorID, requestID uint16, status RequestStatus, queuePos uint8) {
 	s.mu.RLock()
 	sessions := make([]*Session, 0, len(s.sessions))
 	for _, session := range s.sessions {
@@ -1113,6 +1136,9 @@ func (s *Server) broadcastFloorStatus(userID uint16, floorID, requestID uint16, 
 	s.mu.RUnlock()
 
 	for _, session := range sessions {
+		if session == except {
+			continue
+		}
 		txID := uint16(s.nextTxID.Add(1))
 		msg := NewMessage(PrimitiveFloorRequestStatus, s.config.ConferenceID, txID, userID)
 		msg.AddFloorRequestInformationRFC4582(requestID, status, floorID)
